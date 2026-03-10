@@ -56,7 +56,8 @@
       [PATH B]  STEP 6B   Set DeleteOption=Detach on all resources, then delete VM shell
       [PATH B]  STEP 7B   Recreate VM  (New-AzVM; restores TrustedLaunch via SecurityProfile)
       [PATH B]  STEP 8B   Reinstall VM extensions
-      [PATH B]  STEP 9B   Delete snapshot  (unless -KeepSnapshot)
+      [PATH B]  STEP 9B   Restore system-assigned managed identity RBAC assignments
+      [PATH B]  STEP 10B  Delete snapshot  (unless -KeepSnapshot)
 
     Path selection logic:
       Auto   : PATH B when Windows + source and target are in different disk architecture
@@ -146,6 +147,28 @@
     Extensions requiring protected settings (e.g. AzureDiskEncryption, CustomScript)
     are always skipped regardless of this flag and must be reinstalled manually.
     Use when you manage extensions via a deployment pipeline or prefer manual control.
+.PARAMETER RestoreSystemAssignedRBAC
+    Enable automatic export and restore of system-assigned managed identity RBAC
+    role assignments during PATH B (VM recreation).
+
+    Default behaviour (without this switch):
+      The script always detects whether the VM has a system-assigned managed identity
+      and enumerates its direct role assignments before anything is deleted. If any
+      assignments are found you will be asked to confirm before proceeding (skipped
+      with -Force). No export file is created and no automatic restore is performed.
+      Re-assign the RBAC roles manually after recreation using the new principal ID.
+
+    With -RestoreSystemAssignedRBAC:
+      1. Saves all role assignments for the old principal to *-rbac-export.json before
+         deleting the VM.
+      2. After recreation, reads the new system-assigned principal ID and restores each
+         assignment. Results are written to *-rbac-restore-results.json.
+      The prompt shown in default mode is suppressed because the operator has
+      explicitly opted into automatic restore.
+
+    Note: user-assigned managed identities are NOT affected by this switch. Their
+    principal IDs are stable across VM recreation and their RBAC assignments survive
+    the delete/recreate cycle unchanged.
 .PARAMETER DryRun
     Show exactly what would happen without making any changes to the VM or its resources.
     All pre-flight checks (module, quota, SKU, extension enumeration) still run so you
@@ -236,7 +259,7 @@
         -AllowTrustedLaunchDowngrade -FixOperatingSystemSettings -StartVM -WriteLogfile
 
 .NOTES
-    Version: 2.7.2
+    Version: 1.0.0
 
     Module requirements (verified at runtime unless -IgnoreAzureModuleCheck is specified):
       Az.Compute   >= 7.2.0   (DiskControllerType, SecurityProfile, Add-AzVmGalleryApplication,
@@ -297,6 +320,7 @@ param (
     # ── Recreation (PATH B) ──
     [switch]  $KeepSnapshot,
     [switch]  $SkipExtensionReinstall,
+    [switch]  $RestoreSystemAssignedRBAC,
 
     # ── Skip / ignore checks (ordered least → most impactful) ──
     [switch]  $IgnoreAzureModuleCheck,
@@ -330,13 +354,28 @@ $script:_skuCache  = @{}   # region -> PSCustomObject[]  cache for Get-RegionVMS
 
 ##############################################################################################################
 # Helper functions
-#   Group 1 : Logging and user interaction
-#   Group 2 : Pure utilities (no Azure calls, no side effects)
-#   Group 3 : VM state management
-#   Group 4 : RunCommand pipeline
-#   Group 5 : Azure update operations
-#   Group 6 : Domain-specific helpers
+#   Group 1 : Logging and user interaction  (WriteLog, AskToContinue, Stop-Script)
+#   Group 2 : Pure utilities (no Azure calls, no side effects)  (Get-ArmName/RG, Get-AzNICBatch, Get-AzDiskBatch, Get-SKUCapability, CheckModule)
+#   Group 3 : VM state management  (WaitForVMPowerState, EnsureVMRunning)
+#   Group 4 : RunCommand pipeline  (Invoke-RunCommand, ParseAndLogOutput, Invoke-CheckedRunCommand)
+#   Group 5 : Azure update operations  (Invoke-AzWithRetry, Invoke-AzVMUpdate, Get-RegionVMSkus, Set-OSDiskControllerTypes)
+#   Group 6 : Domain-specific helpers  (Get-DiskArchitecture, Get-VMResourcesWithBadDeleteOption,
+#              Restore-SystemAssignedRBACAssignments, Write-TrustedLaunchRestoreNote, Write-VTPMDataLossWarning)
+#
+# Note: Get-ExtensionManualReason and Test-ExtensionRequiresManual are defined inline just before
+# the EXTENSION CHECK pre-flight section. They depend on $_manualExtTypes, a pre-flight variable
+# that does not exist at script startup, so they cannot be hoisted into the groups above.
 ##############################################################################################################
+
+# Fatal-error exception class used by Stop-Script and AskToContinue.
+# Defined here, before the functions that throw it, so the reader sees the type
+# before its first use at Stop-Script / AskToContinue.
+# A distinct class lets the top-level catch block distinguish expected script
+# termination (message already logged by Stop-Script) from unhandled exceptions
+# (which the catch block logs itself).
+class AzVMFatalError : System.Exception {
+    AzVMFatalError([string]$msg) : base($msg) {}
+}
 
 # ── Group 1: Logging and user interaction ────────────────────────────────────────────────────
 
@@ -379,8 +418,23 @@ function AskToContinue {
     $answer = Read-Host "Continue? (Y/N)"
     if ($answer -notin @("Y","y")) {
         WriteLog "Script aborted by user." "ERROR"
-        exit 1
+        throw [AzVMFatalError]::new("Script aborted by user.")
     }
+}
+
+
+function Stop-Script {
+    # Terminates the script with a fatal error.
+    # Logs $Message (when provided), then throws AzVMFatalError so:
+    #   - The top-level catch block catches it cleanly and exits with code 1.
+    #   - The finally block (BCW restore, TrustedLaunch note) always runs.
+    #   - PowerShell pipeline callers see a terminating error ($? = $false)
+    #     rather than having the entire host process killed by exit 1.
+    # For the abort-after-prompt path in AskToContinue, AzVMFatalError is
+    # thrown directly (message already logged) rather than calling Stop-Script.
+    param([string]$Message = '')
+    if ($Message) { WriteLog $Message "ERROR" }
+    throw [AzVMFatalError]::new($Message)
 }
 
 # ── Group 2: Pure utilities ──────────────────────────────────────────────────────────────────
@@ -395,6 +449,73 @@ function Get-ArmRG([string]$ResourceId) {
     return $ResourceId.Split('/')[4]
 }
 
+
+function Get-AzNICBatch {
+    # Fetches multiple NIC objects: parallel on PS7+, sequential on PS5.1.
+    # Returns a hashtable keyed by NIC resource ID.
+    # Call once per loop context instead of one Get-AzNetworkInterface per NIC,
+    # which is expensive on VMs with many NICs (parallel saves N * ~1s round trips).
+    # NIC refs are pre-extracted to plain strings before the parallel block to avoid
+    # Azure SDK object serialisation issues across PS7 runspace boundaries
+    # (same approach as Get-AzDiskBatch).
+    param([object[]]$NicRefs, [int]$ThrottleLimit = 5)
+    $result = @{}
+    if (-not $NicRefs -or $NicRefs.Count -eq 0) { return $result }
+    $nicList = @($NicRefs | ForEach-Object { [PSCustomObject]@{ Id = $_.Id } })
+    if ($PSVersionTable.PSVersion.Major -ge 7 -and $nicList.Count -gt 1) {
+        WriteLog "  Fetching $($nicList.Count) NIC(s) in parallel (PS7, throttle=$ThrottleLimit)..."
+        $parallelOut = $nicList | ForEach-Object -Parallel {
+            [PSCustomObject]@{
+                Id  = $_.Id
+                Obj = Get-AzNetworkInterface -Name ($_.Id.Split('/')[-1]) `
+                          -ResourceGroupName ($_.Id.Split('/')[4]) -ErrorAction SilentlyContinue
+            }
+        } -ThrottleLimit $ThrottleLimit
+        foreach ($r in $parallelOut) { $result[$r.Id] = $r.Obj }
+    } else {
+        foreach ($n in $nicList) {
+            $result[$n.Id] = Get-AzNetworkInterface `
+                -Name ($n.Id.Split('/')[-1]) `
+                -ResourceGroupName ($n.Id.Split('/')[4]) `
+                -ErrorAction SilentlyContinue
+        }
+    }
+    return $result
+}
+
+function Get-AzDiskBatch {
+    # Fetches multiple managed disk objects: parallel on PS7+, sequential on PS5.1.
+    # Input: array of DataDisk references from $vm.StorageProfile.DataDisks.
+    # Returns: hashtable keyed by ManagedDisk.Id -> disk object ($null if fetch failed).
+    # Only managed disks (those with a non-null ManagedDisk.Id) are included;
+    # unmanaged (VHD) disks are silently skipped and will not appear in the result.
+    # Azure SDK objects can lose properties when serialised across PS7 parallel runspace
+    # boundaries, so we pre-extract Name and Id into plain PSCustomObjects before
+    # entering the parallel block.
+    param([object[]]$DataDiskRefs, [int]$ThrottleLimit = 5)
+    $result = @{}
+    $managed = @($DataDiskRefs |
+        Where-Object { $_.ManagedDisk -and $_.ManagedDisk.Id } |
+        ForEach-Object { [PSCustomObject]@{ Name = $_.Name; Id = $_.ManagedDisk.Id } })
+    if ($managed.Count -eq 0) { return $result }
+    if ($PSVersionTable.PSVersion.Major -ge 7 -and $managed.Count -gt 1) {
+        WriteLog "  Fetching $($managed.Count) data disk(s) in parallel (PS7, throttle=$ThrottleLimit)..."
+        $parallelOut = $managed | ForEach-Object -Parallel {
+            [PSCustomObject]@{
+                Id  = $_.Id
+                Obj = Get-AzDisk -Name $_.Name -ResourceGroupName ($_.Id.Split('/')[4]) -ErrorAction SilentlyContinue
+            }
+        } -ThrottleLimit $ThrottleLimit
+        foreach ($r in $parallelOut) { $result[$r.Id] = $r.Obj }
+    } else {
+        foreach ($d in $managed) {
+            $result[$d.Id] = Get-AzDisk -Name $d.Name `
+                -ResourceGroupName ($d.Id.Split('/')[4]) -ErrorAction SilentlyContinue
+        }
+    }
+    return $result
+}
+
 function Get-SKUCapability {
     # Returns a single capability value from a VM SKU object, or $null if SKU is null or
     # the capability is absent.
@@ -402,6 +523,22 @@ function Get-SKUCapability {
     param($SKU, [string]$CapabilityName)
     if (-not $SKU) { return $null }
     return ($SKU.Capabilities | Where-Object { $_.Name -eq $CapabilityName }).Value
+}
+
+function CheckModule {
+    # Verifies that a required Az module is installed and meets the minimum version.
+    # Calls Stop-Script (fatal) if the module is absent or too old, so callers need
+    # no error handling. Defined here (Group 2) rather than at the MODULE CHECK call
+    # site so all helper functions are grouped together at the top of the script.
+    param([string]$Name, [version]$MinVersion)
+    $found = Get-Module -ListAvailable -Name $Name
+    if (-not $found) {
+        Stop-Script "Module '$Name' not installed. Run: Install-Module -Name $Name -Force"
+    }
+    if ($MinVersion -and (@($found | Where-Object { $_.Version -ge $MinVersion }).Count -eq 0)) {
+        Stop-Script "Module '$Name' requires version >= $MinVersion. Run: Update-Module -Name $Name"
+    }
+    WriteLog "Module '$Name' OK (required >= $MinVersion)."
 }
 
 # ── Group 3: VM state management ─────────────────────────────────────────────────────────────
@@ -443,12 +580,12 @@ function EnsureVMRunning {
             Start-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -ErrorAction Stop | Out-Null
             if (-not (WaitForVMPowerState -ExpectedState "PowerState/running" -TimeoutSeconds 360)) {
                 WriteLog "VM could not be started." "ERROR"
-                exit 1
+                Stop-Script
             }
         }
     } catch {
         WriteLog "Error ensuring VM is running: $_" "ERROR"
-        exit 1
+        Stop-Script
     }
 }
 
@@ -533,6 +670,40 @@ function Invoke-CheckedRunCommand {
 
 # ── Group 5: Azure update operations ─────────────────────────────────────────────────────────
 
+
+function Invoke-AzWithRetry {
+    # Wraps an Azure API call with exponential back-off retry for transient errors.
+    # Retries on HTTP 429 (ARM throttling / Too Many Requests), 409 (Conflict /
+    # concurrent update), 500 / 503 (transient service errors), and any message
+    # matching 'RetryableError'. Non-retryable errors are re-thrown immediately.
+    # Use this for write operations (Update-AzVM, Remove-AzVM, New-AzVM, New-AzSnapshot,
+    # Set-AzNetworkInterface, New-AzRoleAssignment, Invoke-RestMethod disk patches).
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [string]$Description  = 'Azure API call',
+        [int]$MaxAttempts     = 3,
+        [int]$InitialDelaySec = 5
+    )
+    $delaySec = $InitialDelaySec
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            return (& $ScriptBlock)
+        } catch {
+            $errMsg     = $_.Exception.Message
+            $statusCode = try { [int]$_.Exception.Response.StatusCode } catch { 0 }
+            $isRetryable = ($errMsg    -match '429|Too Many Requests|RetryableError|Conflict|ServiceUnavailable|InternalServerError') `
+                        -or ($statusCode -in @(409, 429, 500, 503))
+            if ($isRetryable -and $attempt -lt $MaxAttempts) {
+                WriteLog "  $Description - attempt $attempt/$MaxAttempts failed (retryable): $errMsg  -  retrying in ${delaySec}s..." "WARNING"
+                Start-Sleep -Seconds $delaySec
+                $delaySec = [math]::Min($delaySec * 2, 60)   # exponential back-off, max 60 s
+            } else {
+                throw   # non-retryable or max attempts reached - propagate to caller
+            }
+        }
+    }
+}
+
 function Invoke-AzVMUpdate {
     # Centralises the repetitive Get-AzVM -> modify -> Update-AzVM pattern.
     # Accepts a scriptblock that receives $vm and modifies its properties in-place.
@@ -548,7 +719,7 @@ function Invoke-AzVMUpdate {
     )
     $vm = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName
     & $Modify $vm
-    $result = Update-AzVM -ResourceGroupName $ResourceGroupName -VM $vm
+    $result = Invoke-AzWithRetry -Description 'Update-AzVM' -ScriptBlock { Update-AzVM -ResourceGroupName $ResourceGroupName -VM $vm }
     if ($result.StatusCode -and $result.StatusCode -ne 'OK') {
         WriteLog "  $Description`: unexpected status '$($result.StatusCode)'" "WARNING"
     }
@@ -637,7 +808,7 @@ function Set-OSDiskControllerTypes {
     # PowerShell 5.1 does not support -Authentication Bearer; we must marshal to string.
     if ($PSVersionTable.PSVersion.Major -ge 7 -and $tokenObj.Token -is [System.Security.SecureString]) {
         WriteLog "  Using PS7 native SecureString bearer auth (token not materialised as plaintext)."
-        Invoke-RestMethod -Uri $diskUrl -Method PATCH -Authentication Bearer -Token $tokenObj.Token -ContentType 'application/json' -Body $body | Out-Null
+        Invoke-AzWithRetry -Description 'PATCH diskControllerTypes (PS7)' -ScriptBlock { Invoke-RestMethod -Uri $diskUrl -Method PATCH -Authentication Bearer -Token $tokenObj.Token -ContentType 'application/json' -Body $body | Out-Null }
     } else {
         # PS 5.1 path: materialise token to string only when unavoidable
         $rawToken = $tokenObj.Token
@@ -648,7 +819,7 @@ function Set-OSDiskControllerTypes {
         }
         try {
             $headers = @{ 'Content-Type' = 'application/json'; 'Authorization' = "Bearer $rawToken" }
-            Invoke-RestMethod -Uri $diskUrl -Method PATCH -Headers $headers -Body $body | Out-Null
+            Invoke-AzWithRetry -Description 'PATCH diskControllerTypes (PS5)' -ScriptBlock { Invoke-RestMethod -Uri $diskUrl -Method PATCH -Headers $headers -Body $body | Out-Null }
         } finally {
             # Clear the variable references so the plaintext token string does not linger
             # in the PowerShell variable scope. Note: .NET strings are immutable and managed
@@ -734,6 +905,95 @@ function Get-VMResourcesWithBadDeleteOption {
     return $items
 }
 
+# Note: Export-SystemAssignedRBACAssignments was removed in v2.10.0.
+# RBAC assignment enumeration was moved to the pre-flight block (before any VM changes)
+# so the operator can be informed early and confirm/deny proceeding. STEP 5B now writes
+# the export file directly from $_preflightRbacAssignments without a redundant API call.
+
+function Restore-SystemAssignedRBACAssignments {
+    # Re-creates role assignments from an export file onto a new system-assigned principal.
+    # Idempotent: existing assignments are detected and skipped rather than re-created,
+    # so the function is safe to call multiple times (e.g. after a partial failure).
+    # Per-assignment failures are non-fatal: they are collected into the results file so
+    # the operator can see exactly what needs manual follow-up.
+    # Returns a hashtable with keys 'Restored', 'AlreadyExisted', 'Failed' (arrays).
+    param(
+        [Parameter(Mandatory)][string]$NewPrincipalId,
+        [Parameter(Mandatory)][string]$InputPath,
+        [Parameter(Mandatory)][string]$ResultsPath
+    )
+    $result = @{ Restored = @(); AlreadyExisted = @(); Failed = @() }
+
+    if (-not (Test-Path $InputPath)) {
+        WriteLog "  RBAC restore: export file '$InputPath' not found  -  skipping." "WARNING"
+        return $result
+    }
+    try {
+        $raw = Get-Content -Path $InputPath -Raw -ErrorAction Stop
+        $assignments = @($raw | ConvertFrom-Json)
+    } catch {
+        WriteLog "  RBAC restore: could not read '$InputPath': $_  -  skipping." "WARNING"
+        return $result
+    }
+    # Filter out any $null items that PS5.1 ConvertFrom-Json may inject when
+    # deserializing a 'null' JSON value (can occur if the export file was written
+    # with an older PS version and contained an empty array serialized as 'null').
+    $assignments = @($assignments | Where-Object { $_ -and $_.Scope -and $_.RoleDefinitionId })
+    if ($assignments.Count -eq 0) {
+        WriteLog "  RBAC restore: no valid assignments in export file  -  nothing to restore."
+        return $result
+    }
+
+    # Pre-fetch all current assignments for the new principal once, then check in-memory.
+    # Avoids N separate Get-AzRoleAssignment API calls (one per assignment to restore).
+    WriteLog "  Fetching existing role assignments for new principal '$NewPrincipalId'..."
+    $existingAssignments = @(Get-AzRoleAssignment -ObjectId $NewPrincipalId -ErrorAction SilentlyContinue)
+    $existingKeys = @{}
+    foreach ($e in $existingAssignments) {
+        $existingKeys["$($e.Scope)|$($e.RoleDefinitionId)"] = $true
+    }
+
+    WriteLog "  Restoring $($assignments.Count) role assignment(s) to new principal '$NewPrincipalId'..."
+    foreach ($a in $assignments) {
+        try {
+            # Idempotency check: in-memory lookup against pre-fetched assignments
+            $key = "$($a.Scope)|$($a.RoleDefinitionId)"
+            if ($existingKeys.ContainsKey($key)) {
+                WriteLog "    Already exists : '$($a.RoleDefinitionName)' on '$($a.Scope)'"
+                $result.AlreadyExisted += $a
+                continue
+            }
+            Invoke-AzWithRetry -Description "New-AzRoleAssignment ($($a.RoleDefinitionName))" -ScriptBlock { New-AzRoleAssignment -ObjectId $NewPrincipalId -Scope $a.Scope -RoleDefinitionId $a.RoleDefinitionId -ErrorAction Stop | Out-Null }
+            WriteLog "    Restored       : '$($a.RoleDefinitionName)' on '$($a.Scope)'" "INFO"
+            $result.Restored += $a
+        } catch {
+            WriteLog "    FAILED         : '$($a.RoleDefinitionName)' on '$($a.Scope)': $_" "WARNING"
+            $result.Failed += $a
+        }
+    }
+
+    # Write results file for audit - operator can verify what was restored and what needs follow-up.
+    # Use a JSON string built via individual ConvertTo-Json calls to avoid the PS5.1 bug where
+    # ConvertTo-Json serializes empty arrays as 'null' rather than '[]'.
+    $_rRestored = if ($result.Restored.Count -gt 0) { $result.Restored | ConvertTo-Json -Depth 5 -Compress } else { '[]' }
+    $_rExisted  = if ($result.AlreadyExisted.Count -gt 0) { $result.AlreadyExisted | ConvertTo-Json -Depth 5 -Compress } else { '[]' }
+    $_rFailed   = if ($result.Failed.Count -gt 0) { $result.Failed | ConvertTo-Json -Depth 5 -Compress } else { '[]' }
+    # Wrap single-item ConvertTo-Json results (PS5.1 gives {} instead of [{}]) in brackets
+    if ($result.Restored.Count -eq 1)      { $_rRestored = "[$_rRestored]" }
+    if ($result.AlreadyExisted.Count -eq 1) { $_rExisted  = "[$_rExisted]"  }
+    if ($result.Failed.Count -eq 1)         { $_rFailed   = "[$_rFailed]"   }
+    @"
+{
+  "NewPrincipalId": "$NewPrincipalId",
+  "Restored": $_rRestored,
+  "AlreadyExisted": $_rExisted,
+  "Failed": $_rFailed
+}
+"@ | Set-Content -Path $ResultsPath -Encoding UTF8
+    WriteLog "  RBAC restore results written to '$ResultsPath'."
+    return $result
+}
+
 function Write-TrustedLaunchRestoreNote {
     # Emits a log entry with exact PowerShell commands to restore TrustedLaunch manually.
     # Two modes controlled by -AsReminder:
@@ -796,7 +1056,7 @@ function Write-VTPMDataLossWarning {
 ##############################################################################################################
 
 WriteLog "=======================================================" "IMPORTANT"
-WriteLog " AzureVM-NVME-and-localdisk-Conversion.ps1  v2.7.2" "IMPORTANT"
+WriteLog " AzureVM-NVME-and-localdisk-Conversion.ps1  v2.11.1" "IMPORTANT"
 WriteLog "=======================================================" "IMPORTANT"
 if ($WriteLogfile) {
     WriteLog "Log file: $(Resolve-Path -Path '.' -ErrorAction SilentlyContinue)\$script:_logfile" "IMPORTANT"
@@ -815,18 +1075,6 @@ try {
 # MODULE CHECK
 ##############################################################################################################
 
-function CheckModule {
-    param([string]$Name, [version]$MinVersion)
-    $found = Get-Module -ListAvailable -Name $Name
-    if (-not $found) {
-        WriteLog "Module '$Name' not installed. Run: Install-Module -Name $Name -Force" "ERROR"; exit 1
-    }
-    if ($MinVersion -and (@($found | Where-Object { $_.Version -ge $MinVersion }).Count -eq 0)) {
-        WriteLog "Module '$Name' requires version >= $MinVersion. Run: Update-Module -Name $Name" "ERROR"; exit 1
-    }
-    WriteLog "Module '$Name' OK (required >= $MinVersion)."
-}
-
 if (-not $IgnoreAzureModuleCheck) {
     CheckModule -Name "Az.Compute"   -MinVersion "7.2.0"
     CheckModule -Name "Az.Accounts"  -MinVersion "2.13.0"
@@ -842,9 +1090,9 @@ if (-not $IgnoreAzureModuleCheck) {
 
 try {
     $script:_azContext = Get-AzContext
-    if (-not $script:_azContext) { WriteLog "No Azure context. Run 'Connect-AzAccount' first." "ERROR"; exit 1 }
+    if (-not $script:_azContext) { Stop-Script "No Azure context. Run 'Connect-AzAccount' first." }
     WriteLog "Subscription: $($script:_azContext.Subscription.Name) ($($script:_azContext.Subscription.Id))"
-} catch { WriteLog "Error getting Azure context: $_" "ERROR"; exit 1 }
+} catch { Stop-Script "Error getting Azure context: $_" }
 
 try {
     # -Status fetches both the VM model (HardwareProfile, StorageProfile, etc.) AND the
@@ -872,7 +1120,7 @@ try {
     } else {
         WriteLog "VM '$VMName' not found in '$ResourceGroupName': $_" "ERROR"
     }
-    exit 1
+    Stop-Script
 }
 
 $script:_originalSize       = $vm.HardwareProfile.VmSize
@@ -885,6 +1133,10 @@ $script:_originalController = if ($vm.StorageProfile.DiskControllerType) {
                                   "SCSI"
                               }
 $_os                        = $vm.StorageProfile.OsDisk.OsType
+# Managed identity flags: set early so pre-flight checks (RBAC, extension classification)
+# can use them without forward-reference hazards.
+$_hasSystemMI = ($vm.Identity -and ($vm.Identity.Type -like '*SystemAssigned*'))
+$_hasUserMI   = ($vm.Identity -and $vm.Identity.UserAssignedIdentities -and $vm.Identity.UserAssignedIdentities.Count -gt 0)
 WriteLog "Current size        : $script:_originalSize"
 WriteLog "Current controller  : $script:_originalController"
 WriteLog "OS                  : $_os"
@@ -905,7 +1157,7 @@ if ($NewControllerType -eq "NVMe") {
             WriteLog "  Note: ADE is scheduled for retirement on September 15, 2028. Microsoft recommends" "ERROR"
             WriteLog "  migrating to Encryption at Host, which IS compatible with NVMe." "ERROR"
             WriteLog "  See: https://learn.microsoft.com/en-us/azure/virtual-machines/disk-encryption-overview" "ERROR"
-            exit 1
+            Stop-Script
         }
         WriteLog "ADE check: no active Azure Disk Encryption found  -  OK."
     } catch {
@@ -950,31 +1202,77 @@ if ($NewControllerType -eq "NVMe") {
 # AND Update-AzVM (PATH A). Neither error is obvious from the ARM response. Detecting them here,
 # before any changes are made, gives a clear explanation and keeps the VM fully intact.
 #
-# NOTE: this check runs BEFORE path selection, so a CanNotDelete lock causes an abort even when
-# PATH A (resize) would ultimately be chosen. CanNotDelete only blocks Remove-AzVM (PATH B);
-# PATH A is unaffected by it. This is an intentional conservative trade-off: a false-positive
-# abort (safe - VM untouched) is far preferable to a false-negative where PATH B runs into a
-# lock mid-execution after the VM has already been stopped or deleted.
+# Checks four scopes:
+#   VM resource        - direct lock on the VM object itself.
+#   VM resource group  - inherited RG-level lock (no ResourceName on lock object).
+#   Attached disks     - OS disk and all data disks. PATH B patches the OS disk (STEP 4B)
+#                        and reattaches all disks (STEP 7B); a ReadOnly lock on any disk
+#                        will block the REST PATCH in Set-OSDiskControllerTypes.
+#   Attached NICs      - PATH B reattaches NICs; a ReadOnly lock prevents Set-AzNetworkInterface.
+#
+# NOTE: this check runs BEFORE path selection. CanNotDelete only blocks PATH B (Remove-AzVM);
+# PATH A is unaffected. This is an intentional conservative trade-off: a false-positive abort
+# (safe - VM untouched) is far preferable to a false-negative where PATH B runs into a lock
+# mid-execution after the VM has already been stopped or deleted.
 try {
     $_vmLocks = @(Get-AzResourceLock -ResourceGroupName $ResourceGroupName -ResourceName $VMName -ResourceType "Microsoft.Compute/virtualMachines" -ErrorAction SilentlyContinue |
         Where-Object { $_.Properties.Level -in @('CanNotDelete','ReadOnly') })
-    # Group-level locks are inherited by all resources; they have no ResourceName on the lock object.
+    # RG-level locks are inherited by all resources; they have no ResourceName on the lock object.
     $_rgLocks = @(Get-AzResourceLock -ResourceGroupName $ResourceGroupName -ErrorAction SilentlyContinue |
         Where-Object { $_.Properties.Level -in @('CanNotDelete','ReadOnly') -and
                        -not $_.ResourceName })
-    $_allLocks = @($_vmLocks) + @($_rgLocks)
+
+    # OS disk lock (may be in a different resource group from the VM)
+    $_diskLocks = @()
+    try {
+        $_osDiskRGForLock = Get-ArmRG $vm.StorageProfile.OsDisk.ManagedDisk.Id
+        $_diskLocks += @(Get-AzResourceLock -ResourceGroupName $_osDiskRGForLock `
+            -ResourceName $vm.StorageProfile.OsDisk.Name `
+            -ResourceType "Microsoft.Compute/disks" -ErrorAction SilentlyContinue |
+            Where-Object { $_.Properties.Level -in @('CanNotDelete','ReadOnly') })
+    } catch { <# non-fatal: unmanaged OS disk already caught above #> }
+
+    # Data disk locks
+    foreach ($_dd in $vm.StorageProfile.DataDisks) {
+        if (-not $_dd.ManagedDisk -or -not $_dd.ManagedDisk.Id) { continue }
+        try {
+            $_ddRG = Get-ArmRG $_dd.ManagedDisk.Id
+            $_diskLocks += @(Get-AzResourceLock -ResourceGroupName $_ddRG `
+                -ResourceName $_dd.Name `
+                -ResourceType "Microsoft.Compute/disks" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Properties.Level -in @('CanNotDelete','ReadOnly') })
+        } catch { <# non-fatal: skip this disk #> }
+    }
+
+    # NIC locks
+    $_nicLocks = @()
+    foreach ($_nicRef in $vm.NetworkProfile.NetworkInterfaces) {
+        try {
+            $_nicRG   = Get-ArmRG $_nicRef.Id
+            $_nicName = Get-ArmName $_nicRef.Id
+            $_nicLocks += @(Get-AzResourceLock -ResourceGroupName $_nicRG `
+                -ResourceName $_nicName `
+                -ResourceType "Microsoft.Network/networkInterfaces" -ErrorAction SilentlyContinue |
+                Where-Object { $_.Properties.Level -in @('CanNotDelete','ReadOnly') })
+        } catch { <# non-fatal: skip this NIC #> }
+    }
+
+    $_allLocks = @($_vmLocks) + @($_rgLocks) + @($_diskLocks) + @($_nicLocks)
     if ($_allLocks.Count -gt 0) {
         WriteLog "ABORTING  -  $($_allLocks.Count) management lock(s) detected that would block this operation:" "ERROR"
         foreach ($_lk in $_allLocks) {
-            $_scope = if ($_lk.ResourceName) { 'VM' } else { 'Resource Group' }
-            WriteLog "  Lock: '$($_lk.Name)'  Level: $($_lk.Properties.Level)  Scope: $_scope" "ERROR"
+            $_scope = if     ($_lk.ResourceType -eq 'Microsoft.Compute/disks')              { "Disk"  }
+                      elseif ($_lk.ResourceType -eq 'Microsoft.Network/networkInterfaces')  { "NIC"   }
+                      elseif ($_lk.ResourceName)                                             { "VM"    }
+                      else                                                                   { "Resource Group" }
+            WriteLog "  Lock: '$($_lk.Name)'  Level: $($_lk.Properties.Level)  Scope: $_scope$(if ($_lk.ResourceName) { " ('$($_lk.ResourceName)')" })" "ERROR"
         }
         WriteLog "  CanNotDelete  blocks Remove-AzVM (PATH B  -  recreation)." "ERROR"
-        WriteLog "  ReadOnly      blocks both Remove-AzVM (PATH B) and Update-AzVM (PATH A  -  resize)." "ERROR"
+        WriteLog "  ReadOnly      blocks Update-AzVM (PATH A), Remove-AzVM (PATH B), and disk/NIC patches." "ERROR"
         WriteLog "Remove the lock(s) before re-running. To remove: Remove-AzResourceLock -LockId <LockId>" "ERROR"
-        exit 1
+        Stop-Script
     }
-    WriteLog "Resource lock check: no blocking locks  -  OK."
+    WriteLog "Resource lock check: no blocking locks on VM, disks, or NICs  -  OK."
 } catch {
     WriteLog "Warning: could not check resource locks: $_  -  proceeding." "WARNING"
 }
@@ -1105,7 +1403,7 @@ try {
         if ([int]$skuNum -lt 2019) {
             WriteLog "Windows version $skuNum is below the minimum required for NVMe (2019 / build 17763)." "ERROR"
             WriteLog "  Upgrade to Windows Server 2019 or later before converting to NVMe." "ERROR"
-            exit 1
+            Stop-Script
         }
         WriteLog "Windows version $skuNum >= 2019  -  OK."
     }
@@ -1118,25 +1416,25 @@ try {
     if ($skuNum -eq "2019" -and $vm.StorageProfile.DataDisks.Count -gt 0) {
         WriteLog "Windows Server 2019 + NVMe: checking data disks for shared disk configuration (MaxShares > 1)..."
         $_sharedDisks = @()
+        $_ddDiskCache = Get-AzDiskBatch $vm.StorageProfile.DataDisks
         foreach ($_dd in $vm.StorageProfile.DataDisks) {
-            try {
-                if (-not $_dd.ManagedDisk -or -not $_dd.ManagedDisk.Id) {
-                    WriteLog "  Warning: data disk '$($_dd.Name)' (LUN $($_dd.Lun)) has no managed disk ID (unmanaged disk) - skipping MaxShares check." "WARNING"
-                    continue
-                }
-                $_ddRg   = Get-ArmRG $_dd.ManagedDisk.Id
-                $_ddDisk = Get-AzDisk -Name $_dd.Name -ResourceGroupName $_ddRg -ErrorAction Stop
-                if ($_ddDisk.MaxShares -gt 1) { $_sharedDisks += $_dd.Name }
-            } catch {
-                WriteLog "  Warning: could not read MaxShares for disk '$($_dd.Name)': $_" "WARNING"
+            if (-not $_dd.ManagedDisk -or -not $_dd.ManagedDisk.Id) {
+                WriteLog "  Warning: data disk '$($_dd.Name)' (LUN $($_dd.Lun)) has no managed disk ID (unmanaged disk) - skipping MaxShares check." "WARNING"
+                continue
             }
+            $_ddDisk = $_ddDiskCache[$_dd.ManagedDisk.Id]
+            if (-not $_ddDisk) {
+                WriteLog "  Warning: could not read MaxShares for disk '$($_dd.Name)': disk not found or fetch failed." "WARNING"
+                continue
+            }
+            if ($_ddDisk.MaxShares -gt 1) { $_sharedDisks += $_dd.Name }
         }
         if ($_sharedDisks.Count -gt 0) {
             WriteLog "ABORTING  -  Shared Disks with NVMe are not supported on Windows Server 2019." "ERROR"
             WriteLog "  The following data disk(s) are configured as shared (MaxShares > 1):" "ERROR"
             foreach ($_sd in $_sharedDisks) { WriteLog "    $_sd" "ERROR" }
             WriteLog "  Options: upgrade OS to Windows Server 2022+, or keep SCSI controller." "ERROR"
-            exit 1
+            Stop-Script
         }
         WriteLog "  No shared disks (MaxShares > 1) found  -  OK."
     }
@@ -1183,7 +1481,7 @@ if ($NewControllerType -eq "NVMe" -and
         WriteLog "  Confidential VMs have a hardware-bound vTPM root-of-trust that cannot survive" "ERROR"
         WriteLog "  a controller change. The VM must remain on SCSI." "ERROR"
         WriteLog "  Option: Use a SCSI-capable VM size (v5/older) for Confidential VMs." "ERROR"
-        exit 1
+        Stop-Script
     }
 
     # TrustedLaunch: workaround available via -AllowTrustedLaunchDowngrade
@@ -1198,7 +1496,7 @@ if ($NewControllerType -eq "NVMe" -and
         WriteLog "         certs) is permanently destroyed during downgrade. Use -DryRun to preview." "ERROR"
         WriteLog "    3. Remove TrustedLaunch manually (Update-AzVM -SecurityType Standard)," "ERROR"
         WriteLog "       run this script, then re-enable TrustedLaunch manually." "ERROR"
-        exit 1
+        Stop-Script
     }
 
     # -AllowTrustedLaunchDowngrade: warn and confirm, then continue - STEP 2a does the actual work.
@@ -1234,7 +1532,7 @@ if ($vm.StorageProfile.OsDisk.DiffDiskSettings -and
     WriteLog "  snapshotted, reattached, or patched. This script requires a managed OS disk." "ERROR"
     WriteLog "  To convert an ephemeral VM, redeploy it with a managed OS disk first," "ERROR"
     WriteLog "  then run this script on the redeployed VM." "ERROR"
-    exit 1
+    Stop-Script
 }
 
 # Unmanaged OS disk check
@@ -1249,7 +1547,7 @@ if (-not $vm.StorageProfile.OsDisk.ManagedDisk -or
     WriteLog "  managed disk API. This script requires a managed OS disk." "ERROR"
     WriteLog "  Migrate the VM to a managed disk first (Convert-AzVMManagedDisk)," "ERROR"
     WriteLog "  then re-run this script." "ERROR"
-    exit 1
+    Stop-Script
 }
 
 # Generation check
@@ -1265,10 +1563,10 @@ try {
         WriteLog "Generation 1 VM  -  NVMe requires Generation 2." "ERROR"
         WriteLog "  To convert to NVMe you must first migrate the VM to Generation 2." "ERROR"
         WriteLog "  SCSI conversions and resizes on Generation 1 VMs are fully supported." "ERROR"
-        exit 1
+        Stop-Script
     }
     WriteLog "VM Generation: $($osDisk.HyperVGeneration)  -  OK."
-} catch { WriteLog "Error retrieving Hyper-V Generation: $_" "ERROR"; exit 1 }
+} catch { Stop-Script "Error retrieving Hyper-V Generation: $_" }
 
 # Controller / size already correct?
 $_controllerAlreadyCorrect = ($script:_originalController -eq $NewControllerType)
@@ -1298,7 +1596,7 @@ if (-not $IgnoreSKUCheck) {
     $sourceSKU = $allSKUs | Where-Object { $_.Name -eq $script:_originalSize } | Select-Object -First 1
 
     if (-not $targetSKU) {
-        WriteLog "VM size '$VMSize' not found in region '$($vm.Location)'." "ERROR"; exit 1
+        Stop-Script "VM size '$VMSize' not found in region '$($vm.Location)'."
     }
     if (-not $sourceSKU) {
         WriteLog "Current size '$script:_originalSize' not in SKU list  -  name-based detection only." "WARNING"
@@ -1318,7 +1616,7 @@ if (-not $IgnoreSKUCheck) {
             WriteLog "    1. Choose a target size that supports TrustedLaunch." "ERROR"
             WriteLog "    2. Remove TrustedLaunch manually before running this script" "ERROR"
             WriteLog "       (Update-AzVM -SecurityType Standard while deallocated)." "ERROR"
-            exit 1
+            Stop-Script
         }
         WriteLog "TrustedLaunch support on target: '$VMSize' supports TrustedLaunch  -  OK."
     }
@@ -1336,7 +1634,7 @@ if (-not $IgnoreSKUCheck) {
         WriteLog "VM size '$VMSize' is NOT available for this subscription in '$($vm.Location)'." "ERROR"
         WriteLog "  ReasonCode: NotAvailableForSubscription" "ERROR"
         WriteLog "  To request access: https://portal.azure.com/#view/Microsoft_Azure_Capacity/QuotaMenuBlade/~/myQuotas" "ERROR"
-        exit 1
+        Stop-Script
     }
     WriteLog "Subscription restriction check: '$VMSize' available  -  OK."
 
@@ -1345,7 +1643,7 @@ if (-not $IgnoreSKUCheck) {
     if ($_vmZones.Count -gt 0) {
         $zone = $_vmZones[0]
         if (-not ($targetSKU.LocationInfo | Where-Object { $_.Zones -contains $zone })) {
-            WriteLog "Size '$VMSize' not available in zone $zone." "ERROR"; exit 1
+            Stop-Script "Size '$VMSize' not available in zone $zone."
         }
         WriteLog "SKU available in zone $zone  -  OK."
     } else {
@@ -1364,7 +1662,7 @@ if (-not $IgnoreSKUCheck) {
         } elseif ($NewControllerType -eq "NVMe") {
             WriteLog "  Hint: '$VMSize' is SCSI-only. Use -NewControllerType SCSI instead." "ERROR"
         }
-        exit 1
+        Stop-Script
     }
     if (-not $_controllerAlreadyCorrect) {
         WriteLog "Controller check OK: $VMSize supports $effectiveControllerTypes"
@@ -1442,7 +1740,7 @@ if (-not $IgnoreSKUCheck -and -not $IgnoreQuotaCheck) {
                 if ($targetVCPUs -gt $available) {
                     WriteLog "  QUOTA EXCEEDED: Not enough $targetFamily quota. Need $targetVCPUs vCPUs, only $available available." "ERROR"
                     WriteLog "  Request a quota increase: https://portal.azure.com/#view/Microsoft_Azure_Capacity/QuotaMenuBlade/~/myQuotas" "ERROR"
-                    exit 1
+                    Stop-Script
                 }
                 WriteLog "  Family quota  : OK (net change: $(if ($netChange -ge 0) { "+$netChange" } else { "$netChange" }) vCPUs)"
             } else {
@@ -1459,7 +1757,7 @@ if (-not $IgnoreSKUCheck -and -not $IgnoreQuotaCheck) {
                 if ($targetVCPUs -gt $availableSpot) {
                     WriteLog "  QUOTA EXCEEDED: Not enough Spot (lowPriorityCores) quota. Need $targetVCPUs vCPUs, only $availableSpot available." "ERROR"
                     WriteLog "  Request a quota increase: https://portal.azure.com/#view/Microsoft_Azure_Capacity/QuotaMenuBlade/~/myQuotas" "ERROR"
-                    exit 1
+                    Stop-Script
                 }
                 WriteLog "  Spot quota    : OK"
             } else {
@@ -1476,7 +1774,7 @@ if (-not $IgnoreSKUCheck -and -not $IgnoreQuotaCheck) {
             if ($targetVCPUs -gt $availRegional) {
                 WriteLog "  QUOTA EXCEEDED: Not enough regional vCPU quota. Need $targetVCPUs vCPUs, only $availRegional available." "ERROR"
                 WriteLog "  Request a quota increase: https://portal.azure.com/#view/Microsoft_Azure_Capacity/QuotaMenuBlade/~/myQuotas" "ERROR"
-                exit 1
+                Stop-Script
             }
             WriteLog "  Regional quota: OK"
         } else {
@@ -1509,7 +1807,7 @@ if (-not $IgnoreSKUCheck -and $targetSKU) {
         if ([int]$_currentDataDisks -gt [int]$_targetMaxDataDisks) {
             WriteLog "ABORTING  -  VM has $_currentDataDisks data disk(s) but target size '$VMSize' supports at most $_targetMaxDataDisks." "ERROR"
             WriteLog "  Detach $([int]$_currentDataDisks - [int]$_targetMaxDataDisks) data disk(s) before re-running, or choose a larger target size." "ERROR"
-            exit 1
+            Stop-Script
         }
         WriteLog "Data disk count : $_currentDataDisks / $_targetMaxDataDisks  -  OK."
     }
@@ -1521,7 +1819,7 @@ if (-not $IgnoreSKUCheck -and $targetSKU) {
         if ([int]$_currentNICs -gt [int]$_targetMaxNICs) {
             WriteLog "ABORTING  -  VM has $_currentNICs NIC(s) but target size '$VMSize' supports at most $_targetMaxNICs." "ERROR"
             WriteLog "  Detach $([int]$_currentNICs - [int]$_targetMaxNICs) NIC(s) before re-running, or choose a larger target size." "ERROR"
-            exit 1
+            Stop-Script
         }
         WriteLog "NIC count       : $_currentNICs / $_targetMaxNICs  -  OK."
     }
@@ -1533,20 +1831,22 @@ if (-not $IgnoreSKUCheck -and $targetSKU) {
         # Check OS disk
         if ($osDisk.Sku.Name -like "Premium*") { $_premiumDisks += "OS disk '$($osDisk.Name)' ($($osDisk.Sku.Name))" }
         # Check data disks
+        $_ddDiskCache = Get-AzDiskBatch $vm.StorageProfile.DataDisks
         foreach ($_dd in $vm.StorageProfile.DataDisks) {
             if ($_dd.ManagedDisk -and $_dd.ManagedDisk.Id) {
-                try {
-                    $_ddRg   = Get-ArmRG $_dd.ManagedDisk.Id
-                    $_ddDisk = Get-AzDisk -Name $_dd.Name -ResourceGroupName $_ddRg -ErrorAction Stop
-                    if ($_ddDisk.Sku.Name -like "Premium*") { $_premiumDisks += "Data disk '$($_dd.Name)' LUN $($_dd.Lun) ($($_ddDisk.Sku.Name))" }
-                } catch { WriteLog "  Warning: could not check disk type for '$($_dd.Name)': $_" "WARNING" }
+                $_ddDisk = $_ddDiskCache[$_dd.ManagedDisk.Id]
+                if (-not $_ddDisk) {
+                    WriteLog "  Warning: could not check disk type for '$($_dd.Name)': disk not found or fetch failed." "WARNING"
+                    continue
+                }
+                if ($_ddDisk.Sku.Name -like "Premium*") { $_premiumDisks += "Data disk '$($_dd.Name)' LUN $($_dd.Lun) ($($_ddDisk.Sku.Name))" }
             }
         }
         if ($_premiumDisks.Count -gt 0) {
             WriteLog "ABORTING  -  Target size '$VMSize' does not support Premium IO, but the VM has Premium disks:" "ERROR"
             foreach ($_pd in $_premiumDisks) { WriteLog "    $_pd" "ERROR" }
             WriteLog "  Migrate the disk(s) to Standard SSD/HDD, or choose a target size that supports Premium IO." "ERROR"
-            exit 1
+            Stop-Script
         }
         WriteLog "Premium IO check: target does not support Premium IO, no Premium disks attached  -  OK."
     } else {
@@ -1605,7 +1905,7 @@ if ($_crossCategory) {
 # Validate mutually exclusive overrides
 if ($ForcePathA -and $ForcePathB) {
     WriteLog "-ForcePathA and -ForcePathB cannot be used together." "ERROR"
-    exit 1
+    Stop-Script
 }
 
 if ($ForcePathA) {
@@ -1635,6 +1935,28 @@ if ($ForcePathA) {
 }
 
 
+# Unmanaged data disk check (PATH B only)
+# PATH B reattaches data disks by ManagedDisk.Id in STEP 7B. If any data disk is unmanaged
+# (VHD in a Storage Account, ManagedDisk = $null), STEP 7B would crash with a null reference
+# after the VM has already been deleted. PATH A (resize via Update-AzVM) passes data disk
+# objects through as-is and does not reattach by ID, so it is unaffected.
+# This check runs after path selection so we only abort when PATH B is actually selected.
+if ($_useRecreationPath -and $vm.StorageProfile.DataDisks.Count -gt 0) {
+    $_unmanagedDataDisks = @($vm.StorageProfile.DataDisks | Where-Object {
+        -not $_.ManagedDisk -or -not $_.ManagedDisk.Id
+    })
+    if ($_unmanagedDataDisks.Count -gt 0) {
+        WriteLog "ABORTING  -  $($_unmanagedDataDisks.Count) unmanaged data disk(s) detected (VHDs in Storage Account)." "ERROR"
+        WriteLog "  PATH B reattaches data disks by managed disk ID. Unmanaged disks cannot be reattached." "ERROR"
+        foreach ($_ud in $_unmanagedDataDisks) {
+            WriteLog "    LUN $($_ud.Lun): '$($_ud.Name)' (no ManagedDisk.Id)" "ERROR"
+        }
+        WriteLog "  Migrate the data disk(s) to managed disks first, then re-run this script." "ERROR"
+        WriteLog "  To migrate: use Convert-AzVMManagedDisk in the Azure Portal or CLI." "ERROR"
+        Stop-Script
+    }
+}
+
 # Uniform VMSS member check (PATH B only)
 # A Uniform-orchestration VMSS manages its VM instances centrally: instances are identified
 # by an integer index and their VMs cannot exist as standalone ARM resources. New-AzVM cannot
@@ -1655,7 +1977,7 @@ if ($_useRecreationPath -and $vm.VirtualMachineScaleSet) {
             WriteLog "    1. Use -ForcePathA to attempt a direct resize (Update-AzVM) instead." "ERROR"
             WriteLog "       PATH A is safe for Uniform VMSS members: it modifies the VM in-place." "ERROR"
             WriteLog "    2. Use the VMSS upgrade API if you need to change the model (Update-AzVmssInstance)." "ERROR"
-            exit 1
+            Stop-Script
         }
         # Flexible orchestration: PATH B is supported. VM detaches from VMSS on Remove-AzVM
         # and is re-registered via VirtualMachineScaleSet.Id on New-AzVMConfig in STEP 7B.
@@ -1665,6 +1987,64 @@ if ($_useRecreationPath -and $vm.VirtualMachineScaleSet) {
         WriteLog "  If this is a Uniform VMSS, PATH B will fail after VM deletion. Use -ForcePathA to be safe." "WARNING"
         if (-not $Force) { AskToContinue "Could not verify VMSS mode. Continue with PATH B?" }
         else { WriteLog "  Proceeding anyway (-Force specified)." "WARNING" }
+    }
+}
+
+##############################################################################################################
+# SYSTEM-ASSIGNED MI RBAC DETECTION  (PATH B only)
+# Runs right after path selection so it is visible in DryRun output AND before any changes are made.
+# Enumerates direct role assignments for the old system-assigned principal:
+#   - Always logs what was found (deduped).
+#   - Without -RestoreSystemAssignedRBAC: asks for confirmation if any assignments exist
+#     (because the new principal will be different and RBAC will silently break).
+#   - With -RestoreSystemAssignedRBAC: informs the operator that STEP 9B will auto-restore.
+# Results are stored in $_preflightRbacAssignments so STEP 5B can write the export file
+# without an extra API call.
+##############################################################################################################
+
+$_preflightRbacAssignments = @()
+$_preflightRbacFetchFailed = $false
+if ($_useRecreationPath -and $_hasSystemMI) {
+    $_preflightMIPrincipalId = $vm.Identity.PrincipalId
+    WriteLog "System-assigned MI RBAC check (PATH B pre-flight):" "IMPORTANT"
+    WriteLog "  Old principal ID : $_preflightMIPrincipalId"
+    WriteLog "  PATH B (VM recreation) assigns a NEW system-assigned principal after recreation."
+    WriteLog "  Any RBAC role assignments on the old principal will silently break until updated."
+    try {
+        $_rawAssignments = @(Get-AzRoleAssignment -ObjectId $_preflightMIPrincipalId -ErrorAction Stop |
+            ForEach-Object {
+                [PSCustomObject]@{
+                    OriginalPrincipalId = $_preflightMIPrincipalId
+                    Scope               = $_.Scope
+                    RoleDefinitionId    = $_.RoleDefinitionId
+                    RoleDefinitionName  = $_.RoleDefinitionName
+                }
+            })
+        $_preflightRbacAssignments = @($_rawAssignments | Sort-Object Scope, RoleDefinitionId -Unique)
+        if ($_preflightRbacAssignments.Count -gt 0) {
+            WriteLog "  Direct role assignments found ($($_preflightRbacAssignments.Count)):"
+            foreach ($_ra in $_preflightRbacAssignments) {
+                WriteLog "    '$($_ra.RoleDefinitionName)' on '$($_ra.Scope)'"
+            }
+            if ($RestoreSystemAssignedRBAC) {
+                WriteLog "  RBAC restore: ENABLED (-RestoreSystemAssignedRBAC). Assignments will be saved before" "IMPORTANT"
+                WriteLog "    deletion and restored to the new principal in STEP 9B." "IMPORTANT"
+            } else {
+                WriteLog "  RBAC restore: NOT requested. These assignments will NOT be automatically restored." "WARNING"
+                WriteLog "    To auto-restore: re-run with -RestoreSystemAssignedRBAC." "WARNING"
+                WriteLog "    To restore manually after recreation:" "WARNING"
+                WriteLog "      1. Get new principal: (Get-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName').Identity.PrincipalId" "WARNING"
+                WriteLog "      2. Re-create each assignment above with the new principal ID." "WARNING"
+                # AskToContinue handles both -Force (auto-continue) and -DryRun (skip prompt) internally.
+                AskToContinue "$($_preflightRbacAssignments.Count) RBAC assignment(s) will NOT be auto-restored after recreation. Continue?"
+            }
+        } else {
+            WriteLog "  No direct role assignments found  -  nothing to restore." "INFO"
+        }
+    } catch {
+        $_preflightRbacFetchFailed = $true
+        WriteLog "  Warning: could not enumerate RBAC assignments: $_  -  proceeding." "WARNING"
+        WriteLog "    Verify and re-assign RBAC manually after recreation if needed." "WARNING"
     }
 }
 
@@ -1689,10 +2069,10 @@ if (-not $IgnoreSKUCheck) {
             WriteLog "  -EnableAcceleratedNetworking specified - AcceleratedNetworking will be enabled on all NICs." "INFO"
         }
     } elseif ($_accelNetSupported) {
+        $_preflightNicCache = Get-AzNICBatch $vm.NetworkProfile.NetworkInterfaces
         $vm.NetworkProfile.NetworkInterfaces | ForEach-Object {
             $nicName = Get-ArmName $_.Id
-            $nicRg   = Get-ArmRG $_.Id
-            $nicObj  = Get-AzNetworkInterface -Name $nicName -ResourceGroupName $nicRg
+            $nicObj  = $_preflightNicCache[$_.Id]
             if (-not $nicObj.EnableAcceleratedNetworking) {
                 WriteLog "  Advisory: NIC '$nicName' has AcceleratedNetworking disabled. Target size $VMSize supports it." "WARNING"
                 WriteLog "    Enable automatically : re-run with -EnableAcceleratedNetworking" "WARNING"
@@ -1752,10 +2132,8 @@ $_manualExtTypes = @(
     'DockerExtension'
 )
 
-# Managed identity presence on the current VM (used for KeyVault extension handling).
-# Computed here so it's available in both the early check and STEP 8B.
-$_hasSystemMI = ($vm.Identity -and ($vm.Identity.Type -like '*SystemAssigned*'))
-$_hasUserMI   = ($vm.Identity -and $vm.Identity.UserAssignedIdentities -and $vm.Identity.UserAssignedIdentities.Count -gt 0)
+# Managed identity flags: moved to just after the initial VM fetch (above the pre-flight
+# checks) so $_hasSystemMI / $_hasUserMI are available throughout all pre-flight sections.
 
 function Test-ExtensionRequiresManual {
     # Returns $true when an extension type cannot be auto-reinstalled by STEP 8B.
@@ -1788,7 +2166,7 @@ if ($_useRecreationPath) {
                     } elseif ($_hasUserMI) {
                         $_action = "AUTO    - user-assigned MI preserves Key Vault RBAC (identity survives recreation)"
                     } else {
-                        $_action = "AUTO    - will install; Key Vault RBAC must be updated for new system-assigned MI principal"
+                        $_action = if ($RestoreSystemAssignedRBAC) { "AUTO    - will install; Key Vault RBAC restored in STEP 9B (-RestoreSystemAssignedRBAC)" } else { "AUTO    - will install; Key Vault RBAC must be manually updated for new system-assigned MI principal" }
                     }
                 } elseif ($_ext.ExtensionType -eq 'SqlIaasAgent') {
                     # SQL IaaS Agent has no protected settings. Registration is via a separate
@@ -1914,12 +2292,26 @@ if ($DryRun) {
         } elseif ($SkipExtensionReinstall -and $_extensionList.Count -gt 0) {
             WriteLog "  [8B] SKIP extension reinstall (-SkipExtensionReinstall)  -  $($_extensionList.Count) extension(s) need manual reinstall" "WARNING"
         }
-        WriteLog "  [9B] $(if ($KeepSnapshot) { 'RETAIN' } else { 'Delete' }) OS disk snapshot"
+        if ($_hasSystemMI -and $RestoreSystemAssignedRBAC) {
+            WriteLog "  [9B] Restore system-assigned managed identity RBAC assignments (-RestoreSystemAssignedRBAC)"
+        } elseif ($_hasSystemMI -and -not $RestoreSystemAssignedRBAC -and $_preflightRbacAssignments.Count -gt 0) {
+            WriteLog "  [9B] SKIP RBAC auto-restore (-RestoreSystemAssignedRBAC not specified)  -  re-assign manually" "WARNING"
+        }
+        WriteLog "  [10B] $(if ($KeepSnapshot) { 'RETAIN' } else { 'Delete' }) OS disk snapshot"
         WriteLog ""
         WriteLog "RESOURCES THAT WOULD BE MODIFIED / CREATED / DELETED:" "IMPORTANT"
         WriteLog "  OS disk '$($osDisk.Name)': diskControllerTypes updated  (disk is PRESERVED)"
         WriteLog "  VM '$VMName': shell DELETED and RECREATED  (OS disk, NICs and data disks are PRESERVED)"
         WriteLog "  Snapshot: CREATED as backup  ($(if ($KeepSnapshot) { 'retained  -  delete manually when done' } else { 'auto-deleted after successful recreation' }))"
+        if ($_hasSystemMI) {
+            if ($RestoreSystemAssignedRBAC) {
+                WriteLog "  System-assigned MI RBAC: $($_preflightRbacAssignments.Count) assignment(s) will be saved before deletion and restored to new principal in STEP 9B"
+            } elseif ($_preflightRbacAssignments.Count -gt 0) {
+                WriteLog "  System-assigned MI RBAC: $($_preflightRbacAssignments.Count) assignment(s) detected  -  NOT auto-restored (use -RestoreSystemAssignedRBAC to auto-restore)" "WARNING"
+            } else {
+                WriteLog "  System-assigned MI RBAC: no direct assignments found  -  nothing to restore" "INFO"
+            }
+        }
     }
     if ($_extensionList.Count -gt 0) {
         WriteLog ""
@@ -1930,7 +2322,7 @@ if ($DryRun) {
                         else                                                                                                                      { "AUTO  " }
             WriteLog "    [$_action]  $($_ext.Name) ($($_ext.Publisher) / $($_ext.ExtensionType) v$($_ext.TypeHandlerVersion))" "WARNING"
         }
-        WriteLog "  AUTO   = reinstalled automatically in STEP 8B (KeyVault via MI; MMA/OMS via workspace key lookup; SQL IaaS SqlVirtualMachines resource survives VM shell deletion and auto-relinks)"
+        WriteLog "  AUTO   = reinstalled automatically in STEP 8B (KeyVault via MI (RBAC restored in STEP 9B when -RestoreSystemAssignedRBAC); MMA/OMS via workspace key lookup; SQL IaaS SqlVirtualMachines resource survives VM shell deletion and auto-relinks)"
         WriteLog "  MANUAL = protected settings required with no API recovery path  -  reinstall manually after recreation" "WARNING"
         WriteLog "  SKIP   = skipped via -SkipExtensionReinstall" "WARNING"
         $_backupExts = @($_extensionList | Where-Object { $_.ExtensionType -in @('VMSnapshot','VMSnapshotLinux') })
@@ -1951,7 +2343,7 @@ if ($_needPagefileFix -and -not $SkipPagefileFix) {
         WriteLog "STOPPING  -  re-run with one of:" "ERROR"
         WriteLog "  -FixOperatingSystemSettings   Migrate pagefile automatically (recommended)" "ERROR"
         WriteLog "  -SkipPagefileFix              Skip if already migrated manually" "ERROR"
-        exit 1
+        Stop-Script
     }
 }
 
@@ -2040,10 +2432,19 @@ case "$distro" in
             }
         fi ;;
     rhel|centos|rocky|almalinux|sles|suse|ol|fedora|mariner|azurelinux)
-        lsinitrd 2>/dev/null | grep -q nvme && echo "[INFO] NVMe in initrd - OK." || {
-            echo "[ERROR] NVMe NOT in initrd."
-            $fix && { mkdir -p /etc/dracut.conf.d; echo 'add_drivers+=" nvme nvme-core "' > /etc/dracut.conf.d/nvme.conf; dracut -f; echo "[INFO] initrd updated."; }
-        } ;;
+        # Target the running kernel's initramfs specifically (dracut naming convention).
+        # lsinitrd without arguments inspects the most-recently-built image, which may differ
+        # from the running kernel when multiple kernels are installed (e.g. after a yum/zypper
+        # update that installed a new kernel but has not yet rebooted into it).
+        _running_initrd="/boot/initramfs-$(uname -r).img"
+        if [ ! -f "$_running_initrd" ]; then
+            echo "[WARNING] Running kernel initrd not found at $_running_initrd - skipping initrd check."
+        else
+            lsinitrd "$_running_initrd" 2>/dev/null | grep -q nvme && echo "[INFO] NVMe in initrd ($(uname -r)) - OK." || {
+                echo "[ERROR] NVMe NOT in initrd for running kernel $(uname -r)."
+                $fix && { mkdir -p /etc/dracut.conf.d; echo 'add_drivers+=" nvme nvme-core "' > /etc/dracut.conf.d/nvme.conf; dracut -f --kver "$(uname -r)"; echo "[INFO] initrd rebuilt for running kernel $(uname -r)."; }
+            }
+        fi ;;
     flatcar)
         # Flatcar uses a read-only rootfs; NVMe drivers are compiled into the kernel.
         echo "[INFO] Flatcar detected - NVMe driver is built into the kernel, no initrd rebuild needed." ;;
@@ -2163,7 +2564,7 @@ fi
         Invoke-CheckedRunCommand -ScriptString $linuxScript -CommandId "RunShellScript" `
             -Description "Linux NVMe driver prep" `
             -ErrorPrompt "Linux OS check errors (use -FixOperatingSystemSettings to fix). Continue?" | Out-Null
-    } catch { WriteLog "Error in Linux RunCommand: $_" "ERROR"; exit 1 }
+    } catch { Stop-Script "Error in Linux RunCommand: $_" }
 
 } elseif ($IgnoreOSCheck) {
     WriteLog "OS check skipped (IgnoreOSCheck)." "WARNING"
@@ -2244,7 +2645,7 @@ Write-Output "INFO: Pagefile setting updated. Change takes effect on next boot -
         # The VM is about to be deallocated anyway; Windows will use the new
         # pagefile setting when the resized/recreated VM starts up.
         WriteLog "Pagefile setting updated - change will activate on next boot (no reboot required now)."
-    } catch { WriteLog "Error during pagefile migration: $_" "ERROR"; exit 1 }
+    } catch { Stop-Script "Error during pagefile migration: $_" }
 
 } elseif ($_needPagefileFix -and $SkipPagefileFix) {
     WriteLog "Pagefile migration skipped (SkipPagefileFix)  -  assuming already done manually." "WARNING"
@@ -2284,8 +2685,7 @@ if ($_needNvmeTempDiskTask) {
     #                 that cannot be reliably nested inside the here-string)
     if ($NVMEDiskInitScriptLocation -match '["\r\n;`$ ]') {
         WriteLog "NVMEDiskInitScriptLocation contains unsafe characters (`", ;, backtick, `$, space, or newline)." "ERROR"
-        WriteLog "  Use a plain path without spaces or special characters, e.g. 'C:\AdminScripts'." "ERROR"
-        exit 1
+        Stop-Script "  Use a plain path without spaces or special characters, e.g. 'C:\AdminScripts'."
     }
 
     EnsureVMRunning
@@ -2449,7 +2849,7 @@ try {
     }
 } catch {
     Log "ERROR during disk initialization: $_"
-    exit 1
+    Stop-Script
 }
 '@
 
@@ -2564,7 +2964,7 @@ try {
         WriteLog "  No disk changes have been made yet." "ERROR"
         WriteLog "  The VM may still be stopping or stuck. Check the Azure Portal." "ERROR"
         WriteLog "  To return to normal: Start-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName'" "ERROR"
-        exit 1
+        Stop-Script
     }
     WriteLog "VM deallocated."
 } catch {
@@ -2572,7 +2972,7 @@ try {
     WriteLog "  No disk changes have been made yet. VM state is unknown." "ERROR"
     WriteLog "  Check the Azure Portal. If the VM is deallocated, start it manually:" "ERROR"
     WriteLog "    Start-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName'" "ERROR"
-    exit 1
+    Stop-Script
 }
 
 ##############################################################################################################
@@ -2599,7 +2999,7 @@ if ($_isTrustedLaunchDowngrade) {
         WriteLog "VM is deallocated. TrustedLaunch was NOT changed." "ERROR"
         WriteLog "  OS disk was NOT modified. The VM is safe to restart." "ERROR"
         WriteLog "Start the VM manually to restore normal operations: Start-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName'" "ERROR"
-        exit 1
+        Stop-Script
     }
 }
 
@@ -2619,7 +3019,7 @@ if (-not $_useRecreationPath) {
             WriteLog "  VM state: deallocated (stopped). The disk was NOT modified." "ERROR"
             WriteLog "  Start the VM manually, resolve the error, then re-run." "ERROR"
             Write-TrustedLaunchRestoreNote   # no-op if -AllowTrustedLaunchDowngrade was not used
-            exit 1
+            Stop-Script
         }
     } else {
         WriteLog "STEP 3A: Skipped  -  controller already $NewControllerType."
@@ -2643,7 +3043,7 @@ if (-not $_useRecreationPath) {
         WriteLog "  OS disk diskControllerTypes was already patched (STEP 3A). Only size/controller on VM object failed." "ERROR"
         WriteLog "  The disk patch is reversible: re-running rollback also re-patches the disk." "ERROR"
         Write-TrustedLaunchRestoreNote   # no-op if -AllowTrustedLaunchDowngrade was not used
-        exit 1
+        Stop-Script
     }
 
     # STEP 4Aa (PATH A only)  -  Re-enable TrustedLaunch after NVMe conversion
@@ -2702,7 +3102,7 @@ if (-not $_useRecreationPath) {
             WriteLog "  Start manually: Start-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName'" "ERROR"
             WriteLog "ROLLBACK: -NewControllerType $script:_originalController -VMSize '$script:_originalSize' -StartVM" "IMPORTANT"
             Write-TrustedLaunchRestoreNote   # no-op: if we reach here TrustedLaunch was already re-enabled
-            exit 1
+            Stop-Script
         }
     } else {
         WriteLog "VM is OFF. Add -StartVM to start automatically, or start manually." "IMPORTANT"
@@ -2713,29 +3113,6 @@ if (-not $_useRecreationPath) {
 ##############################################################################################################
 
 } else {
-
-# Unmanaged data disk check (PATH B only)
-# PATH B reattaches data disks by ManagedDisk.Id in STEP 7B. If any data disk is unmanaged
-# (VHD in a Storage Account, ManagedDisk = null), STEP 7B will crash with a null reference
-# AFTER the VM has already been deleted. Detect here so the VM is never touched.
-if ($vm.StorageProfile.DataDisks.Count -gt 0) {
-    $_unmanagedDataDisks = @($vm.StorageProfile.DataDisks | Where-Object {
-        -not $_.ManagedDisk -or -not $_.ManagedDisk.Id
-    })
-    if ($_unmanagedDataDisks.Count -gt 0) {
-        WriteLog "ABORTING  -  $($_unmanagedDataDisks.Count) unmanaged data disk(s) detected (VHDs in Storage Account)." "ERROR"
-        WriteLog "  PATH B reattaches data disks by managed disk ID. Unmanaged disks cannot be reattached." "ERROR"
-        foreach ($_ud in $_unmanagedDataDisks) {
-            WriteLog "    LUN $($_ud.Lun): '$($_ud.Name)' (no ManagedDisk.Id)" "ERROR"
-        }
-        WriteLog "  Migrate the data disk(s) to managed disks first, then re-run this script." "ERROR"
-        WriteLog "  To migrate: use Convert-AzVMManagedDisk in the Azure Portal or CLI." "ERROR"
-        WriteLog "  The VM is currently deallocated (stopped in STEP 2). After migrating the disks, start it manually:" "ERROR"
-        WriteLog "    Start-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName'" "ERROR"
-        Write-TrustedLaunchRestoreNote   # no-op if -AllowTrustedLaunchDowngrade was not used
-        exit 1
-    }
-}
 
 # STEP 3B  -  Snapshot OS disk  (safety backup BEFORE any modification)
     # Taken before the disk controller type patch so it captures the disk in its original,
@@ -2764,14 +3141,18 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
         WriteLog "  Snapshot SKU: $_snapSku$(if ($_snapSku -eq 'Standard_ZRS') { ' (zone-pinned VM - ZRS preferred)' })"
         $snapConfig = New-AzSnapshotConfig -SourceUri $osDisk.Id -Location $vm.Location -CreateOption Copy -SkuName $_snapSku
         try {
-            $snapshot = New-AzSnapshot -ResourceGroupName $ResourceGroupName -SnapshotName $snapshotName -Snapshot $snapConfig
+            $snapshot = Invoke-AzWithRetry -Description 'New-AzSnapshot (ZRS)' -ScriptBlock { New-AzSnapshot -ResourceGroupName $ResourceGroupName -SnapshotName $snapshotName -Snapshot $snapConfig }
         } catch {
             # ZRS rejection happens at New-AzSnapshot time (ARM validation), not at config creation.
-            # Fall back to LRS if ZRS was attempted and rejected.
-            if ($_snapSku -eq 'Standard_ZRS') {
+            # Fall back to LRS only when the error message indicates ZRS is genuinely unavailable
+            # in this region. Other errors (429 throttling, transient 5xx) are re-thrown so the
+            # outer catch can surface them as a hard failure rather than silently downgrading.
+            $isZrsUnavailable = ($_snapSku -eq 'Standard_ZRS') -and
+                                ($_.Exception.Message -match 'ZRS|zone.redundant|SkuNotAvailable|not.*supported|not.*available')
+            if ($isZrsUnavailable) {
                 WriteLog "  Standard_ZRS not available in this region - falling back to Standard_LRS." "WARNING"
                 $snapConfig = New-AzSnapshotConfig -SourceUri $osDisk.Id -Location $vm.Location -CreateOption Copy -SkuName Standard_LRS
-                $snapshot   = New-AzSnapshot -ResourceGroupName $ResourceGroupName -SnapshotName $snapshotName -Snapshot $snapConfig
+                $snapshot   = Invoke-AzWithRetry -Description 'New-AzSnapshot (LRS fallback)' -ScriptBlock { New-AzSnapshot -ResourceGroupName $ResourceGroupName -SnapshotName $snapshotName -Snapshot $snapConfig }
             } else { throw }
         }
         WriteLog "Snapshot created: $($snapshot.Id)"
@@ -2780,7 +3161,7 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
         WriteLog "  VM state: deallocated (stopped). No disk changes have been made." "ERROR"
         WriteLog "  Start the VM manually, resolve the snapshot error, then re-run." "ERROR"
         Write-TrustedLaunchRestoreNote   # no-op if -AllowTrustedLaunchDowngrade was not used
-        exit 1
+        Stop-Script
     }
 
     # STEP 4B  -  Update OS disk controller types
@@ -2797,7 +3178,7 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
         WriteLog "  Start the VM manually, resolve the error, then re-run." "ERROR"
         WriteLog "  If needed: restore from snapshot '$snapshotName' (RG: $ResourceGroupName)." "ERROR"
         Write-TrustedLaunchRestoreNote   # no-op if -AllowTrustedLaunchDowngrade was not used
-        exit 1
+        Stop-Script
     }
 
     # STEP 5B  -  Capture VM configuration before deletion
@@ -2850,6 +3231,33 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
     $_zones         = $vm.Zones
     $_bootDiag      = $vm.DiagnosticsProfile
     $_identity      = $vm.Identity
+    # System-assigned managed identity: capture old PrincipalId BEFORE VM deletion.
+    # After Remove-AzVM the old principal is gone; the old principal no longer exists in AAD.
+    # User-assigned identities keep their PrincipalId after recreation and need no export.
+    # The pre-flight check already enumerated role assignments in $_preflightRbacAssignments;
+    # we reuse that data here rather than calling Get-AzRoleAssignment a second time.
+    $_oldSystemMIPrincipalId = if ($_hasSystemMI) { $vm.Identity.PrincipalId } else { $null }
+    $_rbacExportPath          = $null
+    $_rbacResultsPath         = $null
+    $_rbacExportedAssignments = @()
+    $_rbacExportFailed        = $false
+    if ($_oldSystemMIPrincipalId -and $RestoreSystemAssignedRBAC) {
+        $_rbacTimestamp   = (Get-Date).ToString('yyyyMMdd-HHmmss')
+        $_rbacExportPath  = "$VMName-$_rbacTimestamp-rbac-export.json"
+        $_rbacResultsPath = "$VMName-$_rbacTimestamp-rbac-restore-results.json"
+        # Write the pre-flight assignments to the export file.
+        # PS5.1 ConvertTo-Json serializes an empty array as 'null'; write '[]' explicitly.
+        try {
+            $_rbacExportedAssignments = $_preflightRbacAssignments
+            $json = if ($_rbacExportedAssignments.Count -gt 0) { $_rbacExportedAssignments | ConvertTo-Json -Depth 5 } else { '[]' }
+            $json | Set-Content -Path $_rbacExportPath -Encoding UTF8
+            WriteLog "  System-assigned MI: $($_rbacExportedAssignments.Count) assignment(s) saved to '$_rbacExportPath' for STEP 9B restore." "IMPORTANT"
+        } catch {
+            $_rbacExportFailed = $true
+            WriteLog "  System-assigned MI: could not write export file '$_rbacExportPath': $_" "WARNING"
+            WriteLog "    RBAC restore will be skipped. Re-assign manually after recreation if needed." "WARNING"
+        }
+    }
     $_priority      = $vm.Priority
     # Spot/Low VMs: eviction policy (Deallocate or Delete) and max price cap must be preserved.
     # EvictionPolicy defaults to Deallocate and MaxPrice to -1 (no cap) if not captured.
@@ -2975,11 +3383,13 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
     # This applies to BOTH standard Load Balancers and Application Gateways.
     # Check if any NIC has LB or AppGW backend pool associations.
     try {
+        # Fetch all NIC objects in one batch (parallel on PS7) for backend-pool detection
+        # AND for STEP 7B use (AccelNet, Add-AzVMNetworkInterface). Avoids N serial round-trips.
+        $_nicObjects = Get-AzNICBatch $_nics
         $_nicBackendWarnings = @()
         foreach ($_nicId in $_nicIds) {
             $_nicName = Get-ArmName $_nicId
-            $_nicRg   = Get-ArmRG $_nicId
-            $_nicObj  = Get-AzNetworkInterface -Name $_nicName -ResourceGroupName $_nicRg -ErrorAction SilentlyContinue
+            $_nicObj  = $_nicObjects[$_nicId]
             if ($_nicObj) {
                 foreach ($_ipCfg in $_nicObj.IpConfigurations) {
                     $lbPools  = @($_ipCfg.LoadBalancerBackendAddressPools       | Where-Object { $_ })
@@ -3013,6 +3423,45 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
     # Extensions: classified and confirmed by the early check before STEP 1.
     # $_extensionList is already populated; STEP 8B handles reinstall after recreation.
     WriteLog "  Extensions    : $($_extensionList.Count) extension(s) (classified pre-flight; reinstall handled in STEP 8B)"
+
+    # Managed identity summary
+    if ($_identity) {
+        $_miSummary = $_identity.Type
+        if ($_hasSystemMI -and $_hasUserMI) {
+            $_miSummary = "SystemAssigned + UserAssigned ($($vm.Identity.UserAssignedIdentities.Count) user-assigned)"
+        } elseif ($_hasSystemMI) {
+            $_miSummary = "SystemAssigned (PrincipalId: $_oldSystemMIPrincipalId)"
+        } elseif ($_hasUserMI) {
+            $_miSummary = "UserAssigned ($($vm.Identity.UserAssignedIdentities.Count) identity/identities  -  stable across recreation)"
+        }
+        WriteLog "  Managed MI    : $_miSummary"
+        if ($_hasSystemMI) {
+            # The system-assigned principal ID changes after Remove-AzVM + New-AzVM.
+            # Any Azure RBAC role assignments on the old principal (Storage, Key Vault,
+            # Automation, Event Hubs, Log Analytics, etc.) will silently stop working
+            # until re-assigned to the new principal ID.
+            if ($RestoreSystemAssignedRBAC -and $_rbacExportFailed) {
+                WriteLog "  RBAC save     : FAILED  -  see WARNING above. Restore manually after recreation." "WARNING"
+            } elseif ($RestoreSystemAssignedRBAC -and $_rbacExportedAssignments.Count -gt 0) {
+                WriteLog "  RBAC save     : $($_rbacExportedAssignments.Count) assignment(s) saved  ->  will be restored in STEP 9B." "IMPORTANT"
+            } elseif ($RestoreSystemAssignedRBAC) {
+                WriteLog "  RBAC save     : 0 direct assignments  -  nothing to restore in STEP 9B." "INFO"
+            } else {
+                # -RestoreSystemAssignedRBAC not specified: assignments were logged at pre-flight
+                if ($_preflightRbacAssignments.Count -gt 0) {
+                    WriteLog "  RBAC          : $($_preflightRbacAssignments.Count) assignment(s) detected (logged at pre-flight)  -  NOT auto-restored." "WARNING"
+                    WriteLog "    Re-assign manually to new principal after recreation (see pre-flight log for list)." "WARNING"
+                } else {
+                    WriteLog "  RBAC          : no direct assignments found  -  nothing to re-assign." "INFO"
+                }
+            }
+            if ($_hasUserMI) {
+                WriteLog "  User-assigned : RBAC is stable (user-assigned principal IDs survive VM recreation)." "INFO"
+            }
+        }
+    } else {
+        WriteLog "  Managed MI    : none"
+    }
 
     # Azure Automanage detection
     # VMs enrolled in an Automanage configuration profile are assigned a
@@ -3082,7 +3531,7 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
         $vm.StorageProfile.OsDisk.DeleteOption        = "Detach"
         foreach ($dd in $vm.StorageProfile.DataDisks) { $dd.DeleteOption = "Detach" }
         foreach ($nic in $vm.NetworkProfile.NetworkInterfaces) { $nic.DeleteOption = "Detach" }
-        Update-AzVM -ResourceGroupName $ResourceGroupName -VM $vm | Out-Null
+        Invoke-AzWithRetry -Description 'Update-AzVM (set DeleteOption=Detach)' -ScriptBlock { Update-AzVM -ResourceGroupName $ResourceGroupName -VM $vm | Out-Null }
 
         # Verify DeleteOption=Detach on all resources before proceeding to deletion.
         # Update-AzVM is synchronous, but ARM's read-after-write consistency is eventual:
@@ -3104,24 +3553,21 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
             foreach ($item in $badItems) { WriteLog "  $item" "ERROR" }
             WriteLog "The VM has NOT been deleted. Resolve this manually before re-running." "ERROR"
             Write-TrustedLaunchRestoreNote   # no-op if -AllowTrustedLaunchDowngrade was not used
-            exit 1
+            Stop-Script
         }
         WriteLog "Verified: DeleteOption = Detach on OS disk, $($vmVerify.StorageProfile.DataDisks.Count) data disk(s) and $($vmVerify.NetworkProfile.NetworkInterfaces.Count) NIC(s)."
     } catch {
         WriteLog "Error setting/verifying DeleteOption: $_" "ERROR"
         WriteLog "Aborting  -  VM has NOT been deleted. No resources were changed." "ERROR"
         Write-TrustedLaunchRestoreNote   # no-op if -AllowTrustedLaunchDowngrade was not used
-        exit 1
+        Stop-Script
     }
 
     WriteLog "DeleteOption verified  -  deleting VM shell now (disks and NICs are preserved)..." "IMPORTANT"
-    if ($Force) {
-        WriteLog "The original VM '$VMName' will now be DELETED and recreated (-Force specified, skipping confirmation)." "WARNING"
-    } else {
-        AskToContinue "The original VM '$VMName' will now be DELETED and recreated. Continue?"
-    }
+    # AskToContinue handles -Force (auto-continues with log) and -DryRun (no prompt) internally.
+    AskToContinue "The original VM '$VMName' will now be DELETED and recreated. Continue?"
     try {
-        Remove-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Force | Out-Null
+        Invoke-AzWithRetry -Description 'Remove-AzVM' -ScriptBlock { Remove-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Force | Out-Null }
         WriteLog "VM shell deleted. OS disk '$($osDisk.Name)', data disks and NICs are intact."
         # Old VM is gone: Update-AzVM to restore TrustedLaunch is no longer possible.
         # Clear the flag so the finally block does not emit a misleading "run Update-AzVM" note.
@@ -3134,7 +3580,7 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
     } catch {
         WriteLog "Error deleting VM: $_" "ERROR"
         Write-TrustedLaunchRestoreNote   # no-op if -AllowTrustedLaunchDowngrade was not used
-        exit 1
+        Stop-Script
     }
 
     # STEP 7B  -  Create new VM
@@ -3206,16 +3652,18 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
         #   Target supports it + -EnableAcceleratedNetworking -> enable on all NICs.
         #   Target supports it, no flag -> leave NIC setting unchanged.
         WriteLog "  Attaching $($_nics.Count) NIC(s)..."
+        # NIC objects were pre-fetched in STEP 5B (Get-AzNICBatch) - no extra API calls here.
+        # If a NIC was not in the cache (should not happen), fall back to a fresh Get-AzNetworkInterface.
         foreach ($nic in $_nics) {   # use STEP 5B snapshot - $vm is the STEP 6B object (all DeleteOptions=Detach)
             $nicName = Get-ArmName $nic.Id
-            $nicRg   = Get-ArmRG $nic.Id
-            $nicObj  = Get-AzNetworkInterface -Name $nicName -ResourceGroupName $nicRg
+            # Use cached object if present and non-null (SilentlyContinue may leave null in the cache).
+            $nicObj  = if ($_nicObjects -and $_nicObjects.ContainsKey($nic.Id) -and $_nicObjects[$nic.Id]) { $_nicObjects[$nic.Id] } else { Get-AzNetworkInterface -Name $nicName -ResourceGroupName (Get-ArmRG $nic.Id) }
             if (-not $_accelNetSupported) {
                 # Target size does not support accel net - disable if currently enabled
                 if ($nicObj.EnableAcceleratedNetworking) {
                     WriteLog "    NIC: $nicName - disabling AcceleratedNetworking (not supported by $VMSize)..." "WARNING"
                     $nicObj.EnableAcceleratedNetworking = $false
-                    Set-AzNetworkInterface -NetworkInterface $nicObj | Out-Null
+                    Invoke-AzWithRetry -Description "Set-AzNetworkInterface ($nicName disable AccelNet)" -ScriptBlock { Set-AzNetworkInterface -NetworkInterface $nicObj | Out-Null }
                     WriteLog "    NIC: $nicName - AcceleratedNetworking disabled."
                 } else {
                     WriteLog "    NIC: $nicName$(if ($nic.Primary) { ' (primary)' }) - AcceleratedNetworking already disabled."
@@ -3225,7 +3673,7 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
                 if (-not $nicObj.EnableAcceleratedNetworking) {
                     WriteLog "    NIC: $nicName - enabling AcceleratedNetworking (-EnableAcceleratedNetworking)..." "INFO"
                     $nicObj.EnableAcceleratedNetworking = $true
-                    Set-AzNetworkInterface -NetworkInterface $nicObj | Out-Null
+                    Invoke-AzWithRetry -Description "Set-AzNetworkInterface ($nicName enable AccelNet)" -ScriptBlock { Set-AzNetworkInterface -NetworkInterface $nicObj | Out-Null }
                     WriteLog "    NIC: $nicName - AcceleratedNetworking enabled."
                 } else {
                     WriteLog "    NIC: $nicName$(if ($nic.Primary) { ' (primary)' }) - AcceleratedNetworking already enabled."
@@ -3256,12 +3704,41 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
             # If a storage URI is set use it; otherwise enable managed boot diagnostics (no URI needed).
             $_bootUri = $_bootDiag.BootDiagnostics.StorageUri
             if ($_bootUri) {
+                # Parse the storage account name from the URI (https://<account>.blob.core...).
                 $_storageAccountName = $_bootUri -replace 'https?://([^.]+).*','$1'
-                # Set-AzVMBootDiagnostic uses -ResourceGroupName to locate the storage account.
-                # If the account lives in a different RG, this lookup may silently fall back to
-                # managed boot diagnostics. Log a warning so the operator can verify post-creation.
-                WriteLog "  Boot diagnostics: storage account '$_storageAccountName' (looked up in RG: $ResourceGroupName - warn if account is in a different RG)" "WARNING"
-                $newVMConfig = Set-AzVMBootDiagnostic -VM $newVMConfig -Enable -ResourceGroupName $ResourceGroupName -StorageAccountName $_storageAccountName
+                # The storage account may live in a different resource group from the VM.
+                # Set-AzVMBootDiagnostic requires -ResourceGroupName; using the VM's RG would
+                # silently fail (404) and fall back to managed boot diagnostics, losing the
+                # original storage account configuration without any error logged.
+                # Look up the real resource group via a subscription-wide search.
+                $_bootStorageRG     = $null
+                $_bootStorageFailed = $false
+                try {
+                    $_bootStorageAccount = Get-AzStorageAccount -ErrorAction Stop |
+                        Where-Object { $_.StorageAccountName -eq $_storageAccountName } |
+                        Select-Object -First 1
+                    if ($_bootStorageAccount) {
+                        $_bootStorageRG = $_bootStorageAccount.ResourceGroupName
+                    }
+                } catch {
+                    $_bootStorageFailed = $true
+                    WriteLog "  Boot diagnostics: could not enumerate storage accounts to find '$_storageAccountName': $_" "WARNING"
+                    WriteLog "    Falling back to managed boot diagnostics  -  restore original config manually after recreation." "WARNING"
+                }
+                if ($_bootStorageRG) {
+                    WriteLog "  Boot diagnostics: storage account '$_storageAccountName' found in RG '$_bootStorageRG'"
+                    $newVMConfig = Set-AzVMBootDiagnostic -VM $newVMConfig -Enable -ResourceGroupName $_bootStorageRG -StorageAccountName $_storageAccountName
+                } elseif (-not $_bootStorageFailed) {
+                    # Account not found anywhere in this subscription (cross-subscription,
+                    # access-denied at list level already caught above, or account deleted).
+                    WriteLog "  Boot diagnostics: storage account '$_storageAccountName' not found in this subscription." "WARNING"
+                    WriteLog "    Falling back to managed boot diagnostics (Azure-managed storage)." "WARNING"
+                    WriteLog "    To restore original config: Set-AzVMBootDiagnostic -ResourceGroupName <RG> -StorageAccountName '$_storageAccountName'" "WARNING"
+                    $newVMConfig = Set-AzVMBootDiagnostic -VM $newVMConfig -Enable
+                } else {
+                    # Exception path: warning already logged above; enable managed as fallback.
+                    $newVMConfig = Set-AzVMBootDiagnostic -VM $newVMConfig -Enable
+                }
             } else {
                 $newVMConfig = Set-AzVMBootDiagnostic -VM $newVMConfig -Enable
                 WriteLog "  Boot diagnostics: enabled (managed storage)"
@@ -3371,6 +3848,34 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
         if ($_identity) {
             $newVMConfig.Identity = $_identity
             WriteLog "  Managed identity: $($_identity.Type)"
+            # Clarify the operational implications of identity restoration for the operator.
+            # The Identity object is passed to New-AzVM, but the effect differs by identity type:
+            #   SystemAssigned: Azure creates a BRAND-NEW managed identity with a new PrincipalId.
+            #                   The old PrincipalId is gone after Remove-AzVM. Any RBAC role
+            #                   assignments (Storage, Key Vault, Automation, Service Bus, etc.)
+            #                   on the old principal silently stop working. STEP 9B restores these
+            #                   automatically; any failures require manual re-assignment.
+            #   UserAssigned:   The user-assigned identity resource itself is NOT deleted by
+            #                   Remove-AzVM. Its PrincipalId is stable and survives VM recreation.
+            #                   RBAC assignments on user-assigned identities are unaffected.
+            # NOTE: "Managed identity restored" in this log does NOT mean "all RBAC is working".
+            #       For system-assigned identities, RBAC is only fully restored after STEP 9B.
+            if ($_hasSystemMI -and $_hasUserMI) {
+                if ($RestoreSystemAssignedRBAC) {
+                    WriteLog "    SystemAssigned : new PrincipalId assigned by Azure  -  RBAC will be restored in STEP 9B." "WARNING"
+                } else {
+                    WriteLog "    SystemAssigned : new PrincipalId assigned by Azure  -  RBAC NOT auto-restored (see pre-flight log)." "WARNING"
+                }
+                WriteLog "    UserAssigned   : PrincipalId(s) unchanged  -  RBAC on user-assigned identities is unaffected." "INFO"
+            } elseif ($_hasSystemMI) {
+                if ($RestoreSystemAssignedRBAC) {
+                    WriteLog "    SystemAssigned : new PrincipalId assigned by Azure  -  RBAC will be restored in STEP 9B." "WARNING"
+                } else {
+                    WriteLog "    SystemAssigned : new PrincipalId assigned by Azure  -  RBAC NOT auto-restored (re-assign manually)." "WARNING"
+                }
+            } elseif ($_hasUserMI) {
+                WriteLog "    UserAssigned   : PrincipalId(s) stable across recreation  -  RBAC is unaffected." "INFO"
+            }
         }
         if ($_priority) {
             $newVMConfig.Priority = $_priority
@@ -3519,7 +4024,7 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
             WriteLog "    If recreating manually: add SecurityProfile=TrustedLaunch to New-AzVMConfig." "WARNING"
         }
         WriteLog "============================================================" "ERROR"
-        exit 1
+        Stop-Script
     }
 
     # STEP 8B  -  Reinstall VM extensions
@@ -3585,15 +4090,25 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
                 if ($_hasUserMI) {
                     WriteLog "  '$($_ext.Name)' (KeyVault): user-assigned MI found  -  Key Vault RBAC is preserved." "INFO"
                 } else {
-                    # System-assigned only: new VM = new principal ID
-                    WriteLog "  '$($_ext.Name)' (KeyVault): system-assigned MI only  -  IMPORTANT RBAC ACTION REQUIRED:" "WARNING"
-                    WriteLog "    The recreated VM has a NEW system-assigned principal ID." "WARNING"
-                    WriteLog "    Key Vault RBAC role assignments or access policies referencing the old principal" "WARNING"
-                    WriteLog "    will be broken until you update them to the new principal ID." "WARNING"
-                    WriteLog "    After this script completes, run:" "WARNING"
-                    WriteLog "      (Get-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName').Identity.PrincipalId" "WARNING"
-                    WriteLog "    Then update your Key Vault RBAC / access policy with the new principal ID." "WARNING"
-                    WriteLog "    The extension will be installed now and will work once RBAC is fixed." "WARNING"
+                    # System-assigned only: new VM = new principal ID.
+                    # STEP 9B runs AFTER STEP 8B; RBAC may not be in place yet when the extension
+                    # installs. The extension will start working once RBAC is correct.
+                    if ($RestoreSystemAssignedRBAC) {
+                        WriteLog "  '$($_ext.Name)' (KeyVault): system-assigned MI only." "WARNING"
+                        WriteLog "    RBAC restore is enabled (-RestoreSystemAssignedRBAC)." "WARNING"
+                        WriteLog "    STEP 9B (after this step) will restore Key Vault RBAC to the new principal." "WARNING"
+                        WriteLog "    The extension installs now and should work once STEP 9B completes." "WARNING"
+                    } else {
+                        WriteLog "  '$($_ext.Name)' (KeyVault): system-assigned MI only  -  ACTION REQUIRED:" "WARNING"
+                        WriteLog "    The recreated VM has a NEW system-assigned principal ID." "WARNING"
+                        WriteLog "    Key Vault RBAC role assignments or access policies referencing the old principal" "WARNING"
+                        WriteLog "    will be broken until you update them to the new principal ID." "WARNING"
+                        WriteLog "    After this script completes, run:" "WARNING"
+                        WriteLog "      (Get-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName').Identity.PrincipalId" "WARNING"
+                        WriteLog "    Then update your Key Vault RBAC / access policy with the new principal ID." "WARNING"
+                        WriteLog "    Alternatively, re-run with -RestoreSystemAssignedRBAC to auto-restore RBAC." "WARNING"
+                        WriteLog "    The extension installs now and will work once RBAC is fixed." "WARNING"
+                    }
                 }
                 # Extension itself needs no protected settings when using MI
             }
@@ -3732,18 +4247,109 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
             WriteLog "  Azure Backup (VMSnapshot extension): backup protection preserved - same resource ID after recreation." "INFO"
         }
 
+        # Extension post-validation: verify provisioning state of all auto-reinstalled extensions.
+        # Set-AzVMExtension is asynchronous under the hood: it submits the request and waits for
+        # the agent to acknowledge, but the final provisioning state is written by the VM guest agent
+        # after Set-AzVMExtension returns. A brief pause then a fresh Get-AzVMExtension call gives
+        # a more accurate picture than the install-time status alone.
+        # Non-fatal: failures are logged as ACTION REQUIRED but do not abort the script.
+        if ($_reinstalled.Count -gt 0) {
+            WriteLog "  Verifying extension provisioning states (post-install check)..."
+            Start-Sleep -Seconds 15   # allow guest agent time to report final state
+            try {
+                $_postExtensions = @(Get-AzVMExtension -ResourceGroupName $ResourceGroupName -VMName $VMName -ErrorAction Stop)
+                $_extNotSucceeded = @($_postExtensions | Where-Object {
+                    $_.ProvisioningState -ne 'Succeeded' -and
+                    # Skip extensions that are auto-managed by Azure and may still be provisioning
+                    $_.ExtensionType -notin @('VMSnapshot','VMSnapshotLinux','MicrosoftMonitoringAgent')
+                })
+                if ($_extNotSucceeded.Count -eq 0) {
+                    WriteLog "  Extension post-validation: all $($_postExtensions.Count) extension(s) provisioning state = Succeeded." "INFO"
+                } else {
+                    WriteLog "  Extension post-validation: $($_extNotSucceeded.Count) extension(s) NOT in Succeeded state:" "WARNING"
+                    foreach ($_ev in $_extNotSucceeded) {
+                        WriteLog "    ACTION REQUIRED: '$($_ev.Name)' ($($_ev.ExtensionType)) -> ProvisioningState = '$($_ev.ProvisioningState)'" "WARNING"
+                    }
+                    WriteLog "  Check the VM extension blade in the Azure Portal for details." "WARNING"
+                }
+            } catch {
+                WriteLog "  Extension post-validation: could not retrieve extension status: $_  -  verify manually." "WARNING"
+            }
+        }
+
     } elseif ($SkipExtensionReinstall -and $_extensionList.Count -gt 0) {
         WriteLog "STEP 8B: Extension reinstall skipped (-SkipExtensionReinstall). Reinstall $($_extensionList.Count) extension(s) manually." "WARNING"
     } else {
         WriteLog "STEP 8B: No extensions to reinstall."
     }
 
-    # STEP 9B  -  Cleanup snapshot (unless -KeepSnapshot)
+    # STEP 9B  -  Restore system-assigned managed identity RBAC assignments
+    # Only runs when -RestoreSystemAssignedRBAC was specified AND the export file is present.
+    # Without the flag: assignments were logged at pre-flight; operator confirmed to proceed
+    # without auto-restore. Just log the reminder here.
+    if ($_oldSystemMIPrincipalId -and $RestoreSystemAssignedRBAC `
+        -and $_rbacExportPath -and (Test-Path $_rbacExportPath)) {
+        WriteLog "--- STEP 9B: Restoring system-assigned managed identity RBAC assignments ---" "IMPORTANT"
+        try {
+            # Read the new PrincipalId from the recreated VM.
+            # ARM needs a moment to propagate the new identity; retry once if null.
+            $_newVMForRbac   = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -ErrorAction Stop
+            $_newPrincipalId = if ($_newVMForRbac.Identity) { $_newVMForRbac.Identity.PrincipalId } else { $null }
+            if (-not $_newPrincipalId) {
+                WriteLog "  New system-assigned PrincipalId not yet available  -  waiting 20s for ARM propagation..." "WARNING"
+                Start-Sleep -Seconds 20
+                $_newVMForRbac   = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -ErrorAction SilentlyContinue
+                $_newPrincipalId = if ($_newVMForRbac.Identity) { $_newVMForRbac.Identity.PrincipalId } else { $null }
+            }
+            if (-not $_newPrincipalId) {
+                WriteLog "  Could not read new system-assigned PrincipalId  -  RBAC restore skipped." "WARNING"
+                WriteLog "    Restore manually once the VM is running:" "WARNING"
+                WriteLog "      New principal: (Get-AzVM -RG '$ResourceGroupName' -Name '$VMName').Identity.PrincipalId" "WARNING"
+                WriteLog "      Export file  : '$_rbacExportPath'" "WARNING"
+            } else {
+                WriteLog "  Old PrincipalId : $_oldSystemMIPrincipalId"
+                WriteLog "  New PrincipalId : $_newPrincipalId"
+                $_rbacResult = Restore-SystemAssignedRBACAssignments `
+                    -NewPrincipalId $_newPrincipalId `
+                    -InputPath      $_rbacExportPath `
+                    -ResultsPath    $_rbacResultsPath
+                $_nRestored  = @($_rbacResult.Restored).Count
+                $_nExisted   = @($_rbacResult.AlreadyExisted).Count
+                $_nFailed    = @($_rbacResult.Failed).Count
+                $_severity   = if ($_nFailed -gt 0) { "WARNING" } else { "IMPORTANT" }
+                WriteLog "  Result: $_nRestored restored, $_nExisted already existed, $_nFailed failed." $_severity
+                if ($_nFailed -gt 0) {
+                    WriteLog "  ACTION REQUIRED: $_nFailed assignment(s) could not be restored  -  check '$_rbacResultsPath'." "WARNING"
+                }
+            }
+        } catch {
+            WriteLog "  RBAC restore step encountered an error: $_" "WARNING"
+            WriteLog "    Restore manually from '$_rbacExportPath' using Restore-SystemAssignedRBACAssignments." "WARNING"
+        }
+    } elseif ($_oldSystemMIPrincipalId -and $RestoreSystemAssignedRBAC -and $_rbacExportFailed) {
+        WriteLog "STEP 9B: RBAC export failed in STEP 5B  -  restore skipped." "WARNING"
+        WriteLog "  Re-assign manually after the VM is running." "WARNING"
+        WriteLog "  Old PrincipalId : $_oldSystemMIPrincipalId" "WARNING"
+        WriteLog "  New PrincipalId : run: (Get-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName').Identity.PrincipalId" "WARNING"
+    } elseif ($_oldSystemMIPrincipalId -and -not $RestoreSystemAssignedRBAC) {
+        WriteLog "STEP 9B: RBAC auto-restore not requested (-RestoreSystemAssignedRBAC not specified)." "WARNING"
+        if ($_preflightRbacAssignments.Count -gt 0) {
+            WriteLog "  $($_preflightRbacAssignments.Count) assignment(s) were detected at pre-flight and must be re-assigned manually." "WARNING"
+            WriteLog "  Old PrincipalId : $_oldSystemMIPrincipalId" "WARNING"
+            WriteLog "  New PrincipalId : run: (Get-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName').Identity.PrincipalId" "WARNING"
+        } else {
+            WriteLog "  No direct assignments found at pre-flight  -  nothing to re-assign." "INFO"
+        }
+    } elseif (-not $_oldSystemMIPrincipalId) {
+        WriteLog "STEP 9B: No system-assigned managed identity on this VM  -  RBAC restore not applicable."
+    }
+
+    # STEP 10B  -  Cleanup snapshot (unless -KeepSnapshot)
     if (-not $KeepSnapshot) {
-        WriteLog "--- STEP 9B: Removing snapshot (use -KeepSnapshot to retain) ---" "IMPORTANT"
+        WriteLog "--- STEP 10B: Removing snapshot (use -KeepSnapshot to retain) ---" "IMPORTANT"
 
         try {
-            Remove-AzSnapshot -ResourceGroupName $ResourceGroupName -SnapshotName $snapshotName -Force | Out-Null
+            Invoke-AzWithRetry -Description 'Remove-AzSnapshot' -ScriptBlock { Remove-AzSnapshot -ResourceGroupName $ResourceGroupName -SnapshotName $snapshotName -Force | Out-Null }
             WriteLog "Snapshot '$snapshotName' removed."
         } catch {
             WriteLog "Non-fatal: could not remove snapshot '$snapshotName': $_" "WARNING"
@@ -3761,6 +4367,18 @@ if ($vm.StorageProfile.DataDisks.Count -gt 0) {
 # COMPLETION
 ##############################################################################################################
 
+} catch {
+    # Two expected termination paths share this single catch:
+    #   1. AzVMFatalError  - thrown by Stop-Script or AskToContinue abort.
+    #      Message was already written to the log; just exit.
+    #   2. Any other unhandled exception  - log it, then exit.
+    # NOTE: catch [AzVMFatalError] does NOT work in PS5.1 for script-defined
+    # classes (typed catch filters are only resolved for .NET / Add-Type types).
+    # We therefore use a single catch {} with an in-body type check.
+    if ($_.Exception -isnot [AzVMFatalError]) {
+        WriteLog "Unhandled error: $_" "ERROR"
+    }
+    exit 1
 } finally {
     # Always restore breaking change warnings regardless of how the script exits
     if ($_bcwWasEnabled) { Update-AzConfig -DisplayBreakingChangeWarning $true | Out-Null }
@@ -3820,6 +4438,31 @@ if ($_useRecreationPath) {
         WriteLog "    Snapshot was deleted after successful recreation (use -KeepSnapshot to retain it next time)." "IMPORTANT"
     }
     if ($_extensionList.Count -gt 0) { WriteLog "  Extensions: $($_extensionList.Count) found. Check STEP 8B log above for reinstall status." "IMPORTANT" }
+    if ($_oldSystemMIPrincipalId) {
+        if ($RestoreSystemAssignedRBAC -and $_rbacResultsPath -and (Test-Path $_rbacResultsPath)) {
+            try {
+                $_rbacSummary = Get-Content -Path $_rbacResultsPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                $_nFailed = @($_rbacSummary.Failed).Count
+            } catch { $_nFailed = -1 }
+            if ($_nFailed -gt 0) {
+                WriteLog "  MI RBAC           : restore PARTIAL  -  $_nFailed failure(s)  -  review '$_rbacResultsPath'" "WARNING"
+            } elseif ($_nFailed -eq 0) {
+                WriteLog "  MI RBAC           : restored successfully  -  see '$_rbacResultsPath'" "IMPORTANT"
+            } else {
+                WriteLog "  MI RBAC           : results file unreadable  -  check '$_rbacResultsPath' manually" "WARNING"
+            }
+        } elseif ($RestoreSystemAssignedRBAC -and $_rbacExportedAssignments.Count -eq 0) {
+            WriteLog "  MI RBAC           : no direct assignments found  -  nothing to restore" "INFO"
+        } elseif ($RestoreSystemAssignedRBAC -and $_rbacExportFailed) {
+            WriteLog "  MI RBAC           : export FAILED  -  re-assign manually (old principal: $_oldSystemMIPrincipalId)" "WARNING"
+        } elseif (-not $RestoreSystemAssignedRBAC -and $_preflightRbacAssignments.Count -gt 0) {
+            WriteLog "  MI RBAC           : NOT auto-restored  -  $($_preflightRbacAssignments.Count) assignment(s) must be re-assigned manually" "WARNING"
+            WriteLog "    Old principal: $_oldSystemMIPrincipalId" "WARNING"
+            WriteLog "    New principal: run: (Get-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName').Identity.PrincipalId" "WARNING"
+        } elseif (-not $RestoreSystemAssignedRBAC) {
+            WriteLog "  MI RBAC           : no direct assignments found at pre-flight  -  nothing to re-assign" "INFO"
+        }
+    }
 } else {
     WriteLog "ROLLBACK command:" "IMPORTANT"
     if ($_isTrustedLaunchDowngrade) {
