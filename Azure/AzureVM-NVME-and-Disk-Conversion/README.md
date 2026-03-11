@@ -2,7 +2,7 @@
 
 A PowerShell script to convert Azure VMs between SCSI and NVMe disk controllers, and to handle the VM recreation that Windows requires when moving between local-disk and diskless VM sizes.
 
-> **PowerShell:** 5.1 and 7+
+> **Version:** 2.11.1 · **PowerShell:** 5.1 and 7+
 
 ---
 
@@ -457,7 +457,7 @@ For anything else, check the log file (use `-WriteLogfile`) for the last complet
 .\AzureVM-NVME-and-localdisk-Conversion.ps1 `
     -ResourceGroupName "myRG" -VMName "myVM" `
     -NewControllerType SCSI -VMSize "Standard_E8bds_v5" `
-    -IgnoreSKUCheck -StartVM
+    -StartVM
 ```
 
 If that is not possible, restore from the OS disk snapshot (only available if `-KeepSnapshot` was used), or from the most recent Azure Backup recovery point.

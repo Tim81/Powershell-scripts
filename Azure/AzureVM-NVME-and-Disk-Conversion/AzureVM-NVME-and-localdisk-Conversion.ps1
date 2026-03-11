@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Convert Azure Virtual Machines between SCSI and NVMe disk controller,
     with full support for Windows VMs migrating from a size with local temp disk
@@ -105,7 +105,9 @@
 .PARAMETER IgnoreAzureModuleCheck
     Skip the Az module version check.
 .PARAMETER IgnoreOSCheck
-    Skip all OS-level checks (no RunCommand executed).
+    Skip the NVMe driver compatibility checks in STEP 1 (no RunCommand for stornvme/Linux driver prep).
+    STEP 1b (pagefile migration) and STEP 1c (NVMe temp disk task install) are not affected by this
+    switch and will still run when required. Use when the VM agent is unavailable or unreachable.
 .PARAMETER SkipPagefileFix
     Skip pagefile migration even when a disk mismatch is detected.
     Use when the pagefile was already migrated manually.
@@ -147,6 +149,22 @@
     Extensions requiring protected settings (e.g. AzureDiskEncryption, CustomScript)
     are always skipped regardless of this flag and must be reinstalled manually.
     Use when you manage extensions via a deployment pipeline or prefer manual control.
+.PARAMETER SkipExtensions
+    One or more extension NAMES (not types) to skip during automatic reinstallation
+    in STEP 8B (PATH B only). Use this for extensions that are pushed and managed by
+    an external system such as Azure Policy, Microsoft Defender for Cloud, or a third-
+    party management platform — these will re-appear automatically after recreation and
+    should not be reinstalled by the script.
+
+    Example: extensions deployed by Azure Policy (e.g. QualysAgent, Tanium) will be
+    re-deployed when the Policy engine next evaluates compliance (~15 minutes after the
+    VM is running). Attempting to install them via Set-AzVMExtension may conflict with
+    the managing policy or install with incorrect settings.
+
+    Accepts the extension Name as shown in the pre-flight log and in Get-AzVMExtension
+    (the -Name field, e.g. 'QualysAgent', not the ExtensionType).
+
+    To skip all extensions, use -SkipExtensionReinstall instead.
 .PARAMETER RestoreSystemAssignedRBAC
     Enable automatic export and restore of system-assigned managed identity RBAC
     role assignments during PATH B (VM recreation).
@@ -259,7 +277,7 @@
         -AllowTrustedLaunchDowngrade -FixOperatingSystemSettings -StartVM -WriteLogfile
 
 .NOTES
-    Version: 1.0.0
+    Version: 1.0.2
 
     Module requirements (verified at runtime unless -IgnoreAzureModuleCheck is specified):
       Az.Compute   >= 7.2.0   (DiskControllerType, SecurityProfile, Add-AzVmGalleryApplication,
@@ -320,6 +338,7 @@ param (
     # ── Recreation (PATH B) ──
     [switch]  $KeepSnapshot,
     [switch]  $SkipExtensionReinstall,
+    [string[]]$SkipExtensions = @(),
     [switch]  $RestoreSystemAssignedRBAC,
 
     # ── Skip / ignore checks (ordered least → most impactful) ──
@@ -350,7 +369,7 @@ $NewControllerType = switch ($NewControllerType.ToUpper()) {
 
 $script:_starttime = Get-Date
 $script:_logfile   = "AzureVM-NVME-and-localdisk-Conversion-$($VMName)-$((Get-Date).ToString('yyyyMMdd-HHmmss')).log"
-$script:_skuCache  = @{}   # region -> PSCustomObject[]  cache for Get-RegionVMSkus
+$script:_skuCache  = @{}   # location -> SKU object[]  cache for Get-RegionVMSkus
 
 ##############################################################################################################
 # Helper functions
@@ -472,12 +491,21 @@ function Get-AzNICBatch {
             }
         } -ThrottleLimit $ThrottleLimit
         foreach ($r in $parallelOut) { $result[$r.Id] = $r.Obj }
+        # Completeness check: warn for any NIC that came back $null (fetch failed or resource not found).
+        foreach ($n in $nicList) {
+            if (-not $result.ContainsKey($n.Id) -or $null -eq $result[$n.Id]) {
+                WriteLog "  WARNING: NIC '$($n.Id.Split('/')[-1])' could not be fetched (parallel). Status checks for this NIC may be inaccurate." "WARNING"
+            }
+        }
     } else {
         foreach ($n in $nicList) {
             $result[$n.Id] = Get-AzNetworkInterface `
                 -Name ($n.Id.Split('/')[-1]) `
                 -ResourceGroupName ($n.Id.Split('/')[4]) `
                 -ErrorAction SilentlyContinue
+            if ($null -eq $result[$n.Id]) {
+                WriteLog "  WARNING: NIC '$($n.Id.Split('/')[-1])' could not be fetched. Status checks for this NIC may be inaccurate." "WARNING"
+            }
         }
     }
     return $result
@@ -507,10 +535,19 @@ function Get-AzDiskBatch {
             }
         } -ThrottleLimit $ThrottleLimit
         foreach ($r in $parallelOut) { $result[$r.Id] = $r.Obj }
+        # Completeness check: warn for any disk that came back $null (fetch failed or resource not found).
+        foreach ($d in $managed) {
+            if (-not $result.ContainsKey($d.Id) -or $null -eq $result[$d.Id]) {
+                WriteLog "  WARNING: Disk '$($d.Name)' could not be fetched (parallel). Status checks for this disk may be inaccurate." "WARNING"
+            }
+        }
     } else {
         foreach ($d in $managed) {
             $result[$d.Id] = Get-AzDisk -Name $d.Name `
                 -ResourceGroupName ($d.Id.Split('/')[4]) -ErrorAction SilentlyContinue
+            if ($null -eq $result[$d.Id]) {
+                WriteLog "  WARNING: Disk '$($d.Name)' could not be fetched. Status checks for this disk may be inaccurate." "WARNING"
+            }
         }
     }
     return $result
@@ -727,51 +764,32 @@ function Invoke-AzVMUpdate {
 }
 
 function Get-RegionVMSkus {
-    # Retrieves VM SKUs for a region using the REST API with server-side filtering.
-    # Replaces Get-AzComputeResourceSku which downloads ALL resource types (disks, snapshots,
-    # galleries, etc.) and filters client-side — taking 10-30 seconds on large subscriptions.
-    # The REST $filter parameter restricts the response to VMs in the target region only,
-    # reducing payload from ~5 MB to ~500 KB and response time from 10-30s to 2-5s.
+    # Returns all VM SKUs for a region using Get-AzComputeResourceSku -Location.
+    # The -Location parameter filters server-side to one region, returning ~400-500
+    # VM sizes in 2-5 seconds.
     #
-    # Results are cached per region in $script:_skuCache so repeated calls (e.g. when
-    # source and target are in the same region) don't hit the API twice.
+    # The raw REST SKUs API ($filter=location+resourceType) does NOT reliably honour its
+    # filters: in practice it returns the full global catalog (~63,000 entries) and ignores
+    # the location and resourceType conditions. Iterating that list twice (once per size)
+    # takes 2+ minutes. Get-AzComputeResourceSku -Location avoids this entirely.
     #
-    # PowerShell property access is case-insensitive, so the camelCase JSON properties
-    # (name, capabilities, restrictions, locationInfo, family) are accessible as
-    # .Name, .Capabilities, .Restrictions, .LocationInfo, .Family — matching existing code.
+    # Results are cached per region. Because both source and target sizes are typically in
+    # the same region, the second lookup is a free cache hit.
+    #
+    # Returns an array of SKU objects. Callers filter by .Name for the specific size.
     param([string]$Location)
 
     if ($script:_skuCache.ContainsKey($Location)) {
         return $script:_skuCache[$Location]
     }
 
-    WriteLog "Retrieving VM SKUs for '$Location' (server-side filtered REST API)..."
-    $_ctx = if ($script:_azContext) { $script:_azContext } else { Get-AzContext }
-    if (-not $_ctx) { throw "No Azure context. Run Connect-AzAccount first." }
-
-    $filter = "location eq '$Location' and resourceType eq 'virtualMachines'"
-    $path   = "/subscriptions/$($_ctx.Subscription.Id)/providers/Microsoft.Compute/skus" +
-              "?api-version=2021-07-01" +
-              "&`$filter=$([uri]::EscapeDataString($filter))"
-
-    $allSkus = [System.Collections.Generic.List[object]]::new()
-    do {
-        $response = Invoke-AzRestMethod -Method GET -Path $path -ErrorAction Stop
-        if ($response.StatusCode -ne 200) {
-            throw "Resource SKUs API returned HTTP $($response.StatusCode): $($response.Content)"
-        }
-        $payload = $response.Content | ConvertFrom-Json
-        if ($payload.value) { $allSkus.AddRange(@($payload.value)) }
-        # Handle pagination: large subscriptions may return nextLink
-        $path = if ($payload.nextLink) {
-            # nextLink is a full URL; Invoke-AzRestMethod -Path expects a relative path
-            [uri]::new($payload.nextLink).PathAndQuery
-        } else { $null }
-    } while ($path)
-
-    $script:_skuCache[$Location] = $allSkus.ToArray()
+    WriteLog "Retrieving VM SKUs for '$Location'..."
+    $allSkus = @(Get-AzComputeResourceSku -Location $Location -ErrorAction Stop |
+                 Where-Object { $_.ResourceType -eq 'virtualMachines' })
     WriteLog "  Retrieved $($allSkus.Count) VM SKUs for '$Location'."
-    return $script:_skuCache[$Location]
+
+    $script:_skuCache[$Location] = $allSkus
+    return $allSkus
 }
 
 function Set-OSDiskControllerTypes {
@@ -905,7 +923,6 @@ function Get-VMResourcesWithBadDeleteOption {
     return $items
 }
 
-# Note: Export-SystemAssignedRBACAssignments was removed in v2.10.0.
 # RBAC assignment enumeration was moved to the pre-flight block (before any VM changes)
 # so the operator can be informed early and confirm/deny proceeding. STEP 5B now writes
 # the export file directly from $_preflightRbacAssignments without a redundant API call.
@@ -982,16 +999,19 @@ function Restore-SystemAssignedRBACAssignments {
     if ($result.Restored.Count -eq 1)      { $_rRestored = "[$_rRestored]" }
     if ($result.AlreadyExisted.Count -eq 1) { $_rExisted  = "[$_rExisted]"  }
     if ($result.Failed.Count -eq 1)         { $_rFailed   = "[$_rFailed]"   }
-    @"
+    $_resultsJson = @"
 {
   "NewPrincipalId": "$NewPrincipalId",
   "Restored": $_rRestored,
   "AlreadyExisted": $_rExisted,
   "Failed": $_rFailed
 }
-"@ | Set-Content -Path $ResultsPath -Encoding UTF8
+"@
+    # Use WriteAllText with a no-BOM UTF-8 encoder.
+    # Set-Content -Encoding UTF8 writes a UTF-8 BOM in PS5.1; the leading \ufeff makes
+    # ConvertFrom-Json fail when this results file is re-read during completion reporting.
+    [System.IO.File]::WriteAllText($ResultsPath, $_resultsJson, [System.Text.UTF8Encoding]::new($false))
     WriteLog "  RBAC restore results written to '$ResultsPath'."
-    return $result
 }
 
 function Write-TrustedLaunchRestoreNote {
@@ -1056,7 +1076,7 @@ function Write-VTPMDataLossWarning {
 ##############################################################################################################
 
 WriteLog "=======================================================" "IMPORTANT"
-WriteLog " AzureVM-NVME-and-localdisk-Conversion.ps1  v2.11.1" "IMPORTANT"
+WriteLog " AzureVM-NVME-and-localdisk-Conversion.ps1  " "IMPORTANT"
 WriteLog "=======================================================" "IMPORTANT"
 if ($WriteLogfile) {
     WriteLog "Log file: $(Resolve-Path -Path '.' -ErrorAction SilentlyContinue)\$script:_logfile" "IMPORTANT"
@@ -1095,10 +1115,12 @@ try {
 } catch { Stop-Script "Error getting Azure context: $_" }
 
 try {
-    # -Status fetches both the VM model (HardwareProfile, StorageProfile, etc.) AND the
-    # instance view (power state, disk statuses) in a single ARM API call, eliminating
-    # the need for a separate Get-AzVM -Status call later to read the power state.
-    $vm = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Status
+    # Use two separate calls: the plain Get-AzVM returns the full VM model
+    # (HardwareProfile, StorageProfile, SecurityProfile, Identity, etc.).
+    # Get-AzVM -Status returns ONLY the instance view (power state, disk statuses)
+    # in some Az.Compute versions and is NOT guaranteed to populate the model properties.
+    # Merging both into a single -Status call is unreliable across Az module versions.
+    $vm = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName
     WriteLog "VM found: $VMName"
 } catch {
     # If the VM does not exist, it may have been deleted by a previous PATH B run that
@@ -1277,8 +1299,10 @@ try {
     WriteLog "Warning: could not check resource locks: $_  -  proceeding." "WARNING"
 }
 
-# Power state  -  Statuses are available from the -Status flag on the initial Get-AzVM call above.
-$powerState = ($vm.Statuses | Where-Object { $_.Code -like 'PowerState*' } | Select-Object -First 1).Code
+# Power state  -  requires a separate Get-AzVM -Status call; the plain Get-AzVM
+# used above returns only the model and does not populate the Statuses property.
+$_vmStatus  = Get-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Status -ErrorAction SilentlyContinue
+$powerState = ($_vmStatus.Statuses | Where-Object { $_.Code -like 'PowerState*' } | Select-Object -First 1).Code
 WriteLog "Current power state : $powerState"
 
 # Windows version
@@ -2073,7 +2097,10 @@ if (-not $IgnoreSKUCheck) {
         $vm.NetworkProfile.NetworkInterfaces | ForEach-Object {
             $nicName = Get-ArmName $_.Id
             $nicObj  = $_preflightNicCache[$_.Id]
-            if (-not $nicObj.EnableAcceleratedNetworking) {
+            if (-not $nicObj) {
+                # NIC fetch failed (auth/throttle/transient ARM error) - do not report a false advisory.
+                WriteLog "  Advisory: NIC '$nicName' could not be fetched - AcceleratedNetworking status unknown." "WARNING"
+            } elseif (-not $nicObj.EnableAcceleratedNetworking) {
                 WriteLog "  Advisory: NIC '$nicName' has AcceleratedNetworking disabled. Target size $VMSize supports it." "WARNING"
                 WriteLog "    Enable automatically : re-run with -EnableAcceleratedNetworking" "WARNING"
                 WriteLog "    Enable manually      : Azure Portal > NIC '$nicName' > Accelerated networking > Enabled" "WARNING"
@@ -2105,12 +2132,39 @@ function Get-ExtensionManualReason {
         'ServiceFabricNode'                                              { return 'cluster/client certificate config in protected settings' }
         { $_ -in 'VMAccessAgent','VMAccessForLinux' }                   { return 'credentials (password/SSH key) in protected settings - reinstall with new credentials' }
         'DockerExtension'                                                { return 'TLS certs/registry credentials in protected settings; also retired since Nov 2018' }
-        default                                                          { return 'requires manual configuration' }
+        default                                                          { return 'protected settings or complex reinstall required; check extension documentation' }
     }
 }
 
-# Extensions that CANNOT be auto-reinstalled regardless of any workaround.
-# The protected settings they require are never returned by the Azure API.
+# Extensions managed by Azure service planes that re-deploy themselves automatically.
+# These must be SKIPPED in STEP 8B: attempting to install them via Set-AzVMExtension
+# either conflicts with the managing service's own deployment or installs with wrong
+# onboarding settings that the service must provide. They will re-appear on the VM
+# within minutes after recreation once their respective service detects the VM.
+$_azureManagedExtTypes = @(
+    # Azure Backup: reinstalls on the next scheduled backup job. RSV protection is
+    # preserved because the VM resource ID is identical after same-name recreation.
+    'VMSnapshot', 'VMSnapshotLinux',
+    # Microsoft Defender for Cloud / Defender for Servers: MDE onboarding is managed
+    # entirely by MDC. After recreation MDC detects the VM (same resource ID) and
+    # re-pushes the extension automatically with the correct onboarding package.
+    'MDE.Windows', 'MDE.Linux',
+    # Azure Policy guest configuration: the Policy engine re-evaluates compliance after
+    # VM recreation and re-pushes this extension automatically within ~15 minutes.
+    # ExtensionType on Windows is 'ConfigurationforWindows' (not 'AzurePolicyforWindows',
+    # which is only the extension Name). Both are listed; the check uses ExtensionType.
+    'AzurePolicyforWindows', 'ConfigurationforWindows', 'ConfigurationforLinux',
+    # Guest Attestation: pushed automatically by Azure for TrustedLaunch VMs to
+    # enable measured boot and vTPM attestation. No operator action required.
+    'GuestAttestation', 'GuestAttestationLinux'
+)
+# Extensions that cannot be auto-reinstalled by STEP 8B due to one or more of:
+#   - Protected settings that the Azure API never returns (no recovery path without the original values).
+#   - Multi-step installation procedures that go beyond a simple Set-AzVMExtension call (ADE).
+#   - Re-execution risk: running the extension again has destructive side effects (CustomScriptExtension).
+# These are logged as MANUAL in the pre-flight report and STEP 8B. Operator must reinstall after recreation.
+# Note: -SkipExtensions takes precedence over this list — an extension listed by name in -SkipExtensions
+# is always SKIP, even if its type appears here (operator has explicitly opted out).
 $_manualExtTypes = @(
     # Disk encryption: multi-step process (BitLocker/dm-crypt + KV). Never just an extension install.
     'AzureDiskEncryption', 'AzureDiskEncryptionForLinux',
@@ -2155,6 +2209,10 @@ if ($_useRecreationPath) {
             foreach ($_ext in $_extensionList) {
                 if ($SkipExtensionReinstall) {
                     $_action = "SKIP    (-SkipExtensionReinstall)"
+                } elseif ($SkipExtensions -and $_ext.Name -in $SkipExtensions) {
+                    $_action = "SKIP    (-SkipExtensions: managed externally, will re-appear automatically)"
+                } elseif ($_ext.ExtensionType -in $_azureManagedExtTypes) {
+                    $_action = "SKIP    (Azure-managed: will re-appear automatically via service plane)"
                 } elseif ($_ext.ExtensionType -in $_manualExtTypes) {
                     $_reason = Get-ExtensionManualReason -ExtensionType $_ext.ExtensionType
                     $_action = "MANUAL  - $_reason"
@@ -2194,13 +2252,39 @@ if ($_useRecreationPath) {
                     # the resource ID is identical. Azure Backup recognises it as the same VM
                     # and existing recovery points and backup protection are automatically preserved.
                     $_action = "AUTO    - extension reinstalls on next backup job; RSV backup protection is preserved (same resource ID after recreation)"
+                } elseif ($_ext.ExtensionType -in @('MDE.Windows','MDE.Linux')) {
+                    # Managed by Microsoft Defender for Cloud / Defender for Servers.
+                    # MDC identifies VMs by resource ID. After recreation (same name + RG = same
+                    # resource ID) MDC automatically re-pushes the MDE onboarding package.
+                    # Installing via Set-AzVMExtension would conflict with MDC's deployment.
+                    $_action = "AUTO    - re-pushed automatically by Microsoft Defender for Cloud (same resource ID after recreation)"
+                } elseif ($_ext.ExtensionType -in @('AzurePolicyforWindows','ConfigurationforWindows','ConfigurationforLinux')) {
+                    # Managed by Azure Policy. The Policy engine re-evaluates compliance after
+                    # VM recreation and re-deploys this extension automatically within ~15 minutes.
+                    $_action = "AUTO    - re-pushed automatically by Azure Policy engine after compliance evaluation"
+                } elseif ($_ext.ExtensionType -in @('GuestAttestation','GuestAttestationLinux')) {
+                    # Pushed automatically by Azure for TrustedLaunch VMs to enable measured boot
+                    # and vTPM attestation. No operator action or manual install needed.
+                    $_action = "AUTO    - re-pushed automatically by Azure for TrustedLaunch VMs"
                 } else {
                     $_action = "AUTO    - will be reinstalled in STEP 8B"
                 }
                 WriteLog "    [$_action]  $($_ext.Name) ($($_ext.Publisher) / $($_ext.ExtensionType) v$($_ext.TypeHandlerVersion))" "WARNING"
             }
             if (-not $DryRun) {
-                $_hasManual = $_extensionList | Where-Object { Test-ExtensionRequiresManual $_.ExtensionType }
+                # Only count as MANUAL if not already handled by -SkipExtensions.
+                # An extension in -SkipExtensions is intentionally skipped in STEP 8B
+                # even if its type is in $_manualExtTypes; prompting about it would be
+                # misleading since the operator has already signalled they will handle it.
+                # Azure-managed types are skipped in STEP 8B regardless of Test-ExtensionRequiresManual;
+                # exclude them here so they never trigger the MANUAL acknowledgment prompt.
+                # NOTE: comments between -and and the next expression break PS5.1 parsing.
+                # All comments are placed before the Where-Object block; function calls wrapped in ().
+                $_hasManual = $_extensionList | Where-Object {
+                    -not ($SkipExtensions -and $_.Name -in $SkipExtensions) -and
+                    $_.ExtensionType -notin $_azureManagedExtTypes -and
+                    (Test-ExtensionRequiresManual $_.ExtensionType)
+                }
                 if ($_hasManual) {
                     WriteLog "  Extensions marked MANUAL cannot be auto-reinstalled - you must handle them after the script completes." "WARNING"
                     if (-not $Force) {
@@ -2248,6 +2332,12 @@ if ($DryRun) {
     }
     if ($_needPagefileFix -and -not $SkipPagefileFix -and $FixOperatingSystemSettings) {
         WriteLog "  [1b] Pagefile migration D:\ -> C:\ (RunCommand)"
+    } elseif ($_needPagefileFix -and -not $SkipPagefileFix -and -not $FixOperatingSystemSettings) {
+        WriteLog "  [1b] Pagefile migration D:\ -> C:\  *** REQUIRED - real run will ABORT here ***" "WARNING"
+        WriteLog "       Source has a SCSI temp disk (D:\) but target does not  -  pagefile must" "WARNING"
+        WriteLog "       be migrated before the VM is stopped. Add one of:" "WARNING"
+        WriteLog "         -FixOperatingSystemSettings  (migrate automatically via RunCommand)" "WARNING"
+        WriteLog "         -SkipPagefileFix             (skip if migrated manually)" "WARNING"
     }
     if ($_needNvmeTempDiskTask) {
         WriteLog "  [1c] Install NVMe temp disk startup task on VM (RunCommand)"
@@ -2286,9 +2376,22 @@ if ($DryRun) {
             WriteLog "       The TrustedLaunch security posture (SecureBoot + vTPM chip) IS restored in STEP 7B." "WARNING"
         }
         WriteLog "  [7B] CREATE new VM '$VMName'  (size: $VMSize, controller: $NewControllerType)"
-        $_autoCount = @($_extensionList | Where-Object { -not (Test-ExtensionRequiresManual $_.ExtensionType) }).Count
+        # Correct counts: compute mutually exclusive buckets in the same priority order as the
+        # STEP 8B foreach loop (SkipExtensionReinstall > SkipExtensions > azure-managed > MANUAL > AUTO).
+        # Without this order, an extension that matches BOTH MANUAL (by type) AND SkipExtensions
+        # (by name) would be double-counted, making $_autoCount go negative.
+        $_manualCount  = @($_extensionList | Where-Object {
+            -not ($SkipExtensions -and $_.Name -in $SkipExtensions) -and
+            -not ($_.ExtensionType -in $_azureManagedExtTypes) -and
+            (Test-ExtensionRequiresManual $_.ExtensionType) }).Count
+        $_azMgdCount   = @($_extensionList | Where-Object {
+            -not ($SkipExtensions -and $_.Name -in $SkipExtensions) -and
+            $_.ExtensionType -in $_azureManagedExtTypes }).Count
+        $_skipExtCount = @($_extensionList | Where-Object { $SkipExtensions -and $_.Name -in $SkipExtensions }).Count
+        $_autoCount    = $_extensionList.Count - $_manualCount - $_azMgdCount - $_skipExtCount
         if (-not $SkipExtensionReinstall -and $_extensionList.Count -gt 0) {
-            WriteLog "  [8B] Auto-reinstall $_autoCount extension(s)  ($($_extensionList.Count - $_autoCount) require manual reinstall)"
+            $_skipNote = if (($_azMgdCount + $_skipExtCount) -gt 0) { ", $($_azMgdCount + $_skipExtCount) skipped (azure-managed/-SkipExtensions)" } else { "" }
+            WriteLog "  [8B] Auto-reinstall $_autoCount extension(s)  ($_manualCount require manual reinstall$_skipNote)"
         } elseif ($SkipExtensionReinstall -and $_extensionList.Count -gt 0) {
             WriteLog "  [8B] SKIP extension reinstall (-SkipExtensionReinstall)  -  $($_extensionList.Count) extension(s) need manual reinstall" "WARNING"
         }
@@ -2317,17 +2420,19 @@ if ($DryRun) {
         WriteLog ""
         WriteLog "EXTENSIONS  ($($_extensionList.Count) found  -  will be lost on PATH B recreation):" "IMPORTANT"
         foreach ($_ext in $_extensionList) {
-            $_action = if     ($SkipExtensionReinstall)                                                                                          { "SKIP  " }
-                        elseif (Test-ExtensionRequiresManual $_ext.ExtensionType)                                                                 { "MANUAL" }
-                        else                                                                                                                      { "AUTO  " }
+            $_action = if     ($SkipExtensionReinstall)                                      { "SKIP  " }
+                        elseif ($SkipExtensions -and $_ext.Name -in $SkipExtensions)          { "SKIP  " }
+                        elseif ($_ext.ExtensionType -in $_azureManagedExtTypes)               { "SKIP  " }
+                        elseif (Test-ExtensionRequiresManual $_ext.ExtensionType)             { "MANUAL" }
+                        else                                                                  { "AUTO  " }
             WriteLog "    [$_action]  $($_ext.Name) ($($_ext.Publisher) / $($_ext.ExtensionType) v$($_ext.TypeHandlerVersion))" "WARNING"
         }
-        WriteLog "  AUTO   = reinstalled automatically in STEP 8B (KeyVault via MI (RBAC restored in STEP 9B when -RestoreSystemAssignedRBAC); MMA/OMS via workspace key lookup; SQL IaaS SqlVirtualMachines resource survives VM shell deletion and auto-relinks)"
-        WriteLog "  MANUAL = protected settings required with no API recovery path  -  reinstall manually after recreation" "WARNING"
-        WriteLog "  SKIP   = skipped via -SkipExtensionReinstall" "WARNING"
-        $_backupExts = @($_extensionList | Where-Object { $_.ExtensionType -in @('VMSnapshot','VMSnapshotLinux') })
-        if ($_backupExts.Count -gt 0) {
-            WriteLog "  Note: Azure Backup (VMSnapshot extension found). RSV backup protection is preserved after recreation - same VM name/resource group means same resource ID."
+        WriteLog "  AUTO   = reinstalled automatically in STEP 8B (KeyVault via MI; MMA/OMS via workspace key lookup; SQL IaaS auto-relinks)"
+        WriteLog "  MANUAL = protected settings / multi-step install / re-execution risk  -  reinstall manually after recreation" "WARNING"
+        WriteLog "  SKIP   = -SkipExtensionReinstall, -SkipExtensions, or Azure-managed (re-deploys automatically via service plane)" "WARNING"
+        $_azureManagedInList = @($_extensionList | Where-Object { $_.ExtensionType -in $_azureManagedExtTypes })
+        if ($_azureManagedInList.Count -gt 0) {
+            WriteLog "  Note: Azure-managed extensions (MDE, Azure Policy, GuestAttestation, VMSnapshot) re-deploy automatically via their service plane after recreation."
         }
     }
     WriteLog ""
@@ -2849,7 +2954,7 @@ try {
     }
 } catch {
     Log "ERROR during disk initialization: $_"
-    Stop-Script
+    exit 1   # Stop-Script is not available here; this script runs on the VM as a Scheduled Task
 }
 '@
 
@@ -3242,20 +3347,31 @@ if (-not $_useRecreationPath) {
     $_rbacExportedAssignments = @()
     $_rbacExportFailed        = $false
     if ($_oldSystemMIPrincipalId -and $RestoreSystemAssignedRBAC) {
-        $_rbacTimestamp   = (Get-Date).ToString('yyyyMMdd-HHmmss')
-        $_rbacExportPath  = "$VMName-$_rbacTimestamp-rbac-export.json"
-        $_rbacResultsPath = "$VMName-$_rbacTimestamp-rbac-restore-results.json"
-        # Write the pre-flight assignments to the export file.
-        # PS5.1 ConvertTo-Json serializes an empty array as 'null'; write '[]' explicitly.
-        try {
-            $_rbacExportedAssignments = $_preflightRbacAssignments
-            $json = if ($_rbacExportedAssignments.Count -gt 0) { $_rbacExportedAssignments | ConvertTo-Json -Depth 5 } else { '[]' }
-            $json | Set-Content -Path $_rbacExportPath -Encoding UTF8
-            WriteLog "  System-assigned MI: $($_rbacExportedAssignments.Count) assignment(s) saved to '$_rbacExportPath' for STEP 9B restore." "IMPORTANT"
-        } catch {
+        if ($_preflightRbacFetchFailed) {
+            # Pre-flight RBAC enumeration failed - export would be incomplete.
+            # Mark as failed so STEP 9B and the completion block report this accurately.
             $_rbacExportFailed = $true
-            WriteLog "  System-assigned MI: could not write export file '$_rbacExportPath': $_" "WARNING"
-            WriteLog "    RBAC restore will be skipped. Re-assign manually after recreation if needed." "WARNING"
+            WriteLog "  System-assigned MI: RBAC pre-flight fetch failed  -  export skipped. RBAC restore will not run in STEP 9B." "WARNING"
+            WriteLog "    Re-assign RBAC manually after recreation using the new principal ID." "WARNING"
+        } else {
+            $_rbacTimestamp   = (Get-Date).ToString('yyyyMMdd-HHmmss')
+            $_rbacExportPath  = "$VMName-$_rbacTimestamp-rbac-export.json"
+            $_rbacResultsPath = "$VMName-$_rbacTimestamp-rbac-restore-results.json"
+            # Write the pre-flight assignments to the export file.
+            # PS5.1 ConvertTo-Json serializes an empty array as 'null'; write '[]' explicitly.
+            try {
+                $_rbacExportedAssignments = $_preflightRbacAssignments
+                $json = if ($_rbacExportedAssignments.Count -gt 0) { $_rbacExportedAssignments | ConvertTo-Json -Depth 5 } else { '[]' }
+                # Use WriteAllText with a no-BOM encoder.
+                # Set-Content -Encoding UTF8 writes a BOM in PS5.1; the \ufeff prefix makes
+                # ConvertFrom-Json fail when Restore-SystemAssignedRBACAssignments reads this file.
+                [System.IO.File]::WriteAllText($_rbacExportPath, $json, [System.Text.UTF8Encoding]::new($false))
+                WriteLog "  System-assigned MI: $($_rbacExportedAssignments.Count) assignment(s) saved to '$_rbacExportPath' for STEP 9B restore." "IMPORTANT"
+            } catch {
+                $_rbacExportFailed = $true
+                WriteLog "  System-assigned MI: could not write export file '$_rbacExportPath': $_" "WARNING"
+                WriteLog "    RBAC restore will be skipped. Re-assign manually after recreation if needed." "WARNING"
+            }
         }
     }
     $_priority      = $vm.Priority
@@ -3511,14 +3627,9 @@ if (-not $_useRecreationPath) {
         WriteLog "  The TrustedLaunch security posture (SecureBoot + vTPM chip) IS restored on the new VM." "WARNING"
         WriteLog "  Only the vTPM-stored credentials are lost; the OS disk and all data are unaffected." "WARNING"
         WriteLog "  Action required after recreation: re-provision any vTPM-bound credentials." "WARNING"
-        # When -AllowTrustedLaunchDowngrade was already confirmed pre-flight, skip second prompt.
-        # The vTPM data-loss risk was already acknowledged; asking again breaks unattended pipelines
-        # that specified -AllowTrustedLaunchDowngrade without -Force.
-        if (-not $AllowTrustedLaunchDowngrade) {
-            AskToContinue "VM uses TrustedLaunch - vTPM state will be permanently lost on recreation. Continue?"
-        } else {
-            WriteLog "  vTPM data-loss already confirmed at pre-flight (-AllowTrustedLaunchDowngrade)." "WARNING"
-        }
+        # Note: the deletion confirmation prompt below ("VM will now be DELETED") already covers this
+        # as the single point-of-no-return for PATH B. A second prompt here would ask the operator
+        # the same question twice within the same step, with only Azure API calls in between.
     }
 
     # STEP 6B  -  Delete original VM (NICs and disks are NOT deleted)
@@ -3564,8 +3675,15 @@ if (-not $_useRecreationPath) {
     }
 
     WriteLog "DeleteOption verified  -  deleting VM shell now (disks and NICs are preserved)..." "IMPORTANT"
+    # Single point-of-no-return for PATH B. Mentions vTPM loss when TrustedLaunch applies so
+    # the operator sees the most important consequence right before the irreversible action.
     # AskToContinue handles -Force (auto-continues with log) and -DryRun (no prompt) internally.
-    AskToContinue "The original VM '$VMName' will now be DELETED and recreated. Continue?"
+    $_deletePrompt = if ($_securityType -eq 'TrustedLaunch') {
+        "The original VM '$VMName' will now be DELETED and recreated (vTPM state will be permanently lost). Continue?"
+    } else {
+        "The original VM '$VMName' will now be DELETED and recreated. Continue?"
+    }
+    AskToContinue $_deletePrompt
     try {
         Invoke-AzWithRetry -Description 'Remove-AzVM' -ScriptBlock { Remove-AzVM -ResourceGroupName $ResourceGroupName -Name $VMName -Force | Out-Null }
         WriteLog "VM shell deleted. OS disk '$($osDisk.Name)', data disks and NICs are intact."
@@ -3634,7 +3752,7 @@ if (-not $_useRecreationPath) {
                 if ($dd.DeleteOption) {
                     $newVMConfig.StorageProfile.DataDisks[-1].DeleteOption = $dd.DeleteOption
                 }
-                WriteLog "    LUN $($dd.Lun): $($dd.Name) ($($dd.DiskSizeGB) GB, caching: $($dd.Caching)$(if ($dd.WriteAcceleratorEnabled) { ', WriteAccelerator: ON' })$(if ($dd.DeleteOption) { ', DeleteOption: ' + $dd.DeleteOption })"
+                WriteLog "    LUN $($dd.Lun): $($dd.Name) ($($dd.DiskSizeGB) GB, caching: $($dd.Caching)$(if ($dd.WriteAcceleratorEnabled) { ', WriteAccelerator: ON' })$(if ($dd.DeleteOption) { ', DeleteOption: ' + $dd.DeleteOption }))"
             }
         } else {
             WriteLog "  No data disks to attach."
@@ -4040,7 +4158,32 @@ if (-not $_useRecreationPath) {
         $_manualList  = @()
         $_failedList  = @()
 
+        # One-time check: discover which optional parameters the installed Az.Compute version
+        # of Set-AzVMExtension actually accepts. -AutoUpgradeMinorVersion and
+        # -EnableAutomaticUpgrade vary across Az.Compute versions; splatting an unsupported
+        # parameter name causes a "parameter cannot be found" error for every extension.
+        $_setExtCmdParams = (Get-Command Set-AzVMExtension -ErrorAction SilentlyContinue).Parameters
+        $_extSupportsAutoUpgrade   = ($null -ne $_setExtCmdParams -and $_setExtCmdParams.ContainsKey('AutoUpgradeMinorVersion'))
+        $_extSupportsEnableAutoUpg = ($null -ne $_setExtCmdParams -and $_setExtCmdParams.ContainsKey('EnableAutomaticUpgrade'))
+        WriteLog "  Set-AzVMExtension params available: AutoUpgradeMinorVersion=$_extSupportsAutoUpgrade, EnableAutomaticUpgrade=$_extSupportsEnableAutoUpg"
+
         foreach ($_ext in $_extensionList) {
+
+            # ── -SkipExtensions: operator-specified first (overrides ALL other classification) ─
+            # An extension explicitly listed by the operator is always skipped, even if its type
+            # is in $_manualExtTypes. The operator has deliberately opted out; treating it as
+            # MANUAL instead would log misleading ACTION REQUIRED output and contradict the DryRun
+            # summary which shows it as SKIP. Must come before the MANUAL and azure-managed checks.
+            if ($SkipExtensions -and $_ext.Name -in $SkipExtensions) {
+                WriteLog "  SKIP (-SkipExtensions): '$($_ext.Name)' ($($_ext.ExtensionType))  -  skipped by operator request." "INFO"
+                continue
+            }
+
+            # ── Azure-managed extensions: skip, they re-deploy via their own service plane ──
+            if ($_ext.ExtensionType -in $_azureManagedExtTypes) {
+                WriteLog "  SKIP (Azure-managed): '$($_ext.Name)' ($($_ext.ExtensionType))  -  will re-appear automatically." "INFO"
+                continue
+            }
 
             # ── Definitive MANUAL check ──────────────────────────────────────────────────────
             if ($_ext.ExtensionType -in $_manualExtTypes) {
@@ -4069,8 +4212,17 @@ if (-not $_useRecreationPath) {
                 TypeHandlerVersion = $_ver
                 Location           = $_location
             }
-            if ($null -ne $_ext.AutoUpgradeMinorVersion) { $_extParams['AutoUpgradeMinorVersion'] = $_ext.AutoUpgradeMinorVersion }
-            if ($null -ne $_ext.EnableAutomaticUpgrade)  { $_extParams['EnableAutomaticUpgrade']  = $_ext.EnableAutomaticUpgrade  }
+            # Guard optional parameters against Az.Compute version differences.
+            # -AutoUpgradeMinorVersion was the original parameter name; newer versions of
+            # Az.Compute renamed it to -EnableAutomaticUpgrade. The wrong name causes a
+            # "parameter cannot be found" error when splatting. Availability was checked
+            # once before the loop (see $_extSupportsAutoUpgrade / $_extSupportsEnableAutoUpg).
+            if ($null -ne $_ext.AutoUpgradeMinorVersion -and $_extSupportsAutoUpgrade) {
+                $_extParams['AutoUpgradeMinorVersion'] = $_ext.AutoUpgradeMinorVersion
+            }
+            if ($null -ne $_ext.EnableAutomaticUpgrade -and $_extSupportsEnableAutoUpg) {
+                $_extParams['EnableAutomaticUpgrade'] = $_ext.EnableAutomaticUpgrade
+            }
             if ($_ext.Settings -and $_ext.Settings.Count -gt 0) { $_extParams['Settings'] = $_ext.Settings }
 
             # ── Special handling ─────────────────────────────────────────────────────────────
@@ -4237,14 +4389,19 @@ if (-not $_useRecreationPath) {
             $_failedList | ForEach-Object { WriteLog "    - $($_.Name) ($($_.ExtensionType))" "WARNING" }
         }
 
-        # Azure Backup note
-        # PATH B recreates the VM with the same name and resource group -> same ARM resource ID.
-        # Azure Backup identifies VMs by resource ID; the RSV backup item, existing recovery points,
-        # and backup schedule are all preserved automatically. No manual re-configuration needed.
-        # The VMSnapshot/VMSnapshotLinux extension reinstalls automatically on the next backup job.
-        $_hasBackup = @($_extensionList | Where-Object { $_.ExtensionType -in @('VMSnapshot','VMSnapshotLinux') })
-        if ($_hasBackup.Count -gt 0) {
-            WriteLog "  Azure Backup (VMSnapshot extension): backup protection preserved - same resource ID after recreation." "INFO"
+        # Azure-managed extensions note: these re-deploy via their own service plane.
+        # No manual action needed; they will re-appear automatically after recreation.
+        $_hasAzureManaged = @($_extensionList | Where-Object { $_.ExtensionType -in $_azureManagedExtTypes })
+        if ($_hasAzureManaged.Count -gt 0) {
+            $_hasBackup = @($_hasAzureManaged | Where-Object { $_.ExtensionType -in @('VMSnapshot','VMSnapshotLinux') })
+            if ($_hasBackup.Count -gt 0) {
+                WriteLog "  Azure Backup (VMSnapshot): backup protection preserved - same resource ID after recreation." "INFO"
+            }
+            $_otherManaged = @($_hasAzureManaged | Where-Object { $_.ExtensionType -notin @('VMSnapshot','VMSnapshotLinux') })
+            if ($_otherManaged.Count -gt 0) {
+                WriteLog "  Azure-managed extensions ($($_otherManaged.Count)): will re-appear automatically via their service plane:" "INFO"
+                $_otherManaged | ForEach-Object { WriteLog "    - $($_.Name) ($($_.ExtensionType))" "INFO" }
+            }
         }
 
         # Extension post-validation: verify provisioning state of all auto-reinstalled extensions.
@@ -4260,8 +4417,21 @@ if (-not $_useRecreationPath) {
                 $_postExtensions = @(Get-AzVMExtension -ResourceGroupName $ResourceGroupName -VMName $VMName -ErrorAction Stop)
                 $_extNotSucceeded = @($_postExtensions | Where-Object {
                     $_.ProvisioningState -ne 'Succeeded' -and
-                    # Skip extensions that are auto-managed by Azure and may still be provisioning
-                    $_.ExtensionType -notin @('VMSnapshot','VMSnapshotLinux','MicrosoftMonitoringAgent')
+                    # Skip extensions that are auto-managed by Azure service planes and may
+                    # still be provisioning or not yet re-deployed at this point
+                    $_.ExtensionType -notin $_azureManagedExtTypes -and
+                    # Skip extensions the operator explicitly excluded from reinstall (-SkipExtensions).
+                    # These were not installed by STEP 8B; they may be pushed by an external system
+                    # (e.g. Azure Policy) and could show as Updating or Creating at this point.
+                    -not ($SkipExtensions -and $_.Name -in $SkipExtensions) -and
+                    # MMA/OMS workspace-key extensions can take longer than the 15s wait to fully
+                    # provision; exclude both to avoid a spurious ACTION REQUIRED on Linux/Windows.
+                    $_.ExtensionType -notin @('MicrosoftMonitoringAgent','OmsAgentForLinux') -and
+                    # KeyVault extensions authenticate via managed identity. When a system-assigned MI
+                    # is present, RBAC is only restored in STEP 9B (which runs AFTER this post-check).
+                    # Excluding them here prevents a false "ACTION REQUIRED" before RBAC is in place.
+                    # Their status should be verified manually after STEP 9B completes.
+                    $_.ExtensionType -notin @('KeyVaultForWindows','KeyVaultForLinux')
                 })
                 if ($_extNotSucceeded.Count -eq 0) {
                     WriteLog "  Extension post-validation: all $($_postExtensions.Count) extension(s) provisioning state = Succeeded." "INFO"
@@ -4427,11 +4597,12 @@ if ($_useRecreationPath) {
     WriteLog "ROLLBACK options:" "IMPORTANT"
     WriteLog "  Option 1  -  Re-run this script to go back to original size/controller:" "IMPORTANT"
     WriteLog "    .\AzureVM-NVME-and-localdisk-Conversion.ps1 -ResourceGroupName '$ResourceGroupName' -VMName '$VMName' ``" "IMPORTANT"
-    WriteLog "    -NewControllerType $script:_originalController -VMSize '$script:_originalSize' -IgnoreSKUCheck -StartVM" "IMPORTANT"
+    WriteLog "    -NewControllerType $script:_originalController -VMSize '$script:_originalSize' -StartVM" "IMPORTANT"
     if ($_isTrustedLaunchDowngrade) {
         WriteLog "    Note: -AllowTrustedLaunchDowngrade is NOT needed for rollback  -  the TrustedLaunch restriction only applies to SCSI->NVMe conversion." "IMPORTANT"
     }
-    WriteLog "  Option 2  -  Restore from snapshot $(if ($KeepSnapshot) { "(retained: '$snapshotName')" } else { '(only available if -KeepSnapshot was specified)' }):" "IMPORTANT"
+    $_snapNote = if ($KeepSnapshot) { "(retained: '$snapshotName')" } else { '(only available if -KeepSnapshot was specified)' }
+    WriteLog "  Option 2  -  Restore from snapshot ${_snapNote}:" "IMPORTANT"
     if ($KeepSnapshot) {
         WriteLog "    Create a new managed disk from snapshot '$snapshotName', then recreate the VM." "IMPORTANT"
     } else {
@@ -4455,6 +4626,13 @@ if ($_useRecreationPath) {
             WriteLog "  MI RBAC           : no direct assignments found  -  nothing to restore" "INFO"
         } elseif ($RestoreSystemAssignedRBAC -and $_rbacExportFailed) {
             WriteLog "  MI RBAC           : export FAILED  -  re-assign manually (old principal: $_oldSystemMIPrincipalId)" "WARNING"
+        } elseif ($RestoreSystemAssignedRBAC) {
+            # Fallback: RestoreRBAC was requested, export did not fail, but restore results file is absent.
+            # Most likely cause: STEP 9B could not read the new principal ID (VM identity not yet visible)
+            # and skipped the restore step. Check the STEP 9B log output above for details.
+            WriteLog "  MI RBAC           : restore results unavailable  -  verify STEP 9B log output above and re-assign manually if needed" "WARNING"
+            WriteLog "    Old principal: $_oldSystemMIPrincipalId" "WARNING"
+            WriteLog "    New principal: run: (Get-AzVM -ResourceGroupName '$ResourceGroupName' -Name '$VMName').Identity.PrincipalId" "WARNING"
         } elseif (-not $RestoreSystemAssignedRBAC -and $_preflightRbacAssignments.Count -gt 0) {
             WriteLog "  MI RBAC           : NOT auto-restored  -  $($_preflightRbacAssignments.Count) assignment(s) must be re-assigned manually" "WARNING"
             WriteLog "    Old principal: $_oldSystemMIPrincipalId" "WARNING"
@@ -4473,7 +4651,7 @@ if ($_useRecreationPath) {
     WriteLog "    -VMName '$VMName' ``" "IMPORTANT"
     WriteLog "    -NewControllerType $script:_originalController ``" "IMPORTANT"
     WriteLog "    -VMSize '$script:_originalSize' ``" "IMPORTANT"
-    WriteLog "    -IgnoreSKUCheck -StartVM" "IMPORTANT"
+    WriteLog "    -StartVM" "IMPORTANT"
 }
 
 # Reminder about NVMe temp disk initialization for dependent startup tasks.
@@ -4561,7 +4739,7 @@ if ($_os -eq "Linux" -and $NewControllerType -eq "NVMe" -and $script:_originalCo
         WriteLog "    point to the wrong disk after any caching policy change." "IMPORTANT"
         WriteLog "    Use UUID= in fstab or /dev/disk/azure/data/by-lun/X paths exclusively." "IMPORTANT"
         WriteLog "" 
-        WriteLog "    Important: if you need to change a disk's caching policy after NVMe conversion," "IMPORTANT"
+        WriteLog "    Important: if you need to change a disk caching policy after NVMe conversion," "IMPORTANT"
         WriteLog "    always stop the VM first, apply the change, then start it again. Changing caching" "IMPORTANT"
         WriteLog "    while the VM is running on NVMe can cause the disk to silently reassign to a" "IMPORTANT"
         WriteLog "    different controller, resulting in path changes or remapping issues." "IMPORTANT"
