@@ -2,7 +2,7 @@
 
 A PowerShell script to convert Azure VMs between SCSI and NVMe disk controllers, and to handle the VM recreation that Windows requires when moving between local-disk and diskless VM sizes.
 
-> **Version:** 2.11.1 · **PowerShell:** 5.1 and 7+
+> **Version:** 2.14.0 · **PowerShell:** 5.1 and 7+
 
 ---
 
@@ -59,7 +59,13 @@ The script picks the right path automatically based on the source and target VM 
 Used for all Linux VMs, and for Windows VMs where source and target are in the same disk architecture category.
 
 ```
-OS prep  ->  Stop VM  ->  Patch OS disk controller type  ->  Resize  ->  Start
+OS prep (STEP 1)
+  ->  Stop VM (STEP 2)
+  ->  [TrustedLaunch downgrade to Standard (STEP 2a) — only with -AllowTrustedLaunchDowngrade]
+  ->  Patch OS disk controller type (STEP 3A)
+  ->  Resize VM (STEP 4A)
+  ->  [Re-enable TrustedLaunch (STEP 4Aa) — only with -AllowTrustedLaunchDowngrade]
+  ->  Start VM (STEP 5A)
 ```
 
 ### PATH B — Recreate (`New-AzVM`)
@@ -78,12 +84,21 @@ Used for Windows VMs where source and target are in different disk architecture 
 Linux VMs are not affected and always use PATH A.
 
 ```
-OS prep  ->  Pagefile migration  ->  Stop VM  ->  Snapshot OS disk (safety backup)
-  ->  Patch OS disk controller type  ->  Capture VM config
-  ->  Set DeleteOption=Detach on all resources  ->  Delete VM shell
-  ->  Recreate VM (original OS disk + NICs + data disks)
-  ->  Reinstall extensions  ->  Restore RBAC (when -RestoreSystemAssignedRBAC)
-  ->  Delete snapshot
+OS prep (STEP 1)
+  ->  Pagefile migration D:\ -> C:\ (STEP 1b) — when source has SCSI temp disk
+  ->  Install NVMe temp disk startup task (STEP 1c) — when target has NVMe temp disk
+  ->  Stop VM (STEP 2)
+  ->  [TrustedLaunch downgrade to Standard (STEP 2a) — only with -AllowTrustedLaunchDowngrade]
+  ->  Snapshot OS disk — safety backup, taken BEFORE any modification (STEP 3B)
+  ->  Patch OS disk controller type (STEP 4B)
+  ->  Capture full VM configuration (STEP 5B)
+  ->  Set DeleteOption=Detach on all resources, then delete VM shell (STEP 6B)
+  ->  Recreate VM reusing original OS disk + NICs + data disks (STEP 7B)
+       TrustedLaunch is restored here via SecurityProfile when -AllowTrustedLaunchDowngrade was used
+  ->  Reinstall VM extensions (STEP 8B)
+  ->  Restore system-assigned managed identity RBAC assignments (STEP 9B)
+       Only when -RestoreSystemAssignedRBAC is specified
+  ->  Delete snapshot (STEP 10B) — unless -KeepSnapshot
 ```
 
 The following VM properties are carried over to the recreated VM: NICs (including original DeleteOptions), data disks, tags, managed identity, proximity placement groups, availability sets, capacity reservations, load balancer backend pool associations, TrustedLaunch security profile, EncryptionAtHost, boot diagnostics, Marketplace plan, Spot priority/eviction policy, dedicated host or host group, VMSS Flexible membership, platform fault domain, UserData, ScheduledEventsProfile (terminate notification), VM Gallery Applications, VmSizeProperties (constrained vCPU/SMT), and ExtendedLocation (Edge Zones).
@@ -157,26 +172,33 @@ A role that includes `Microsoft.Authorization/roleAssignments/write` (such as **
 - Generation 2 VM **when converting to NVMe**. Gen1 is blocked at the platform level for NVMe. SCSI-to-SCSI resizes and local-disk-to-diskless recreations work fine on Gen1.
 - Windows Server 2019 or later **when converting to NVMe** (checked automatically unless `-IgnoreWindowsVersionCheck` is specified; not checked for SCSI-to-SCSI or local-disk-to-diskless).
 - Linux: any NVMe-supported marketplace image. The script rebuilds the initrd and configures GRUB automatically with `-FixOperatingSystemSettings`.
+- Managed OS disk (not an ephemeral disk or unmanaged VHD). Both PATH A and PATH B require a managed disk for the REST PATCH and snapshot operations.
 
 ### Pre-flight checks
 
 The script validates the following before making any changes:
 
 - **Azure module versions** — Az.Compute, Az.Accounts, Az.Resources, Az.Network at their minimum required versions.
-- **Resource locks** — `CanNotDelete` and `ReadOnly` locks on the VM, its OS disk, all data disks, and all NICs are detected and the script aborts before any changes.
+- **Resource locks** — `CanNotDelete` and `ReadOnly` locks on the VM, its OS disk, all data disks, and all NICs are detected and the script aborts before any changes. Checks four scopes: VM resource, VM resource group, all attached disks, all attached NICs.
 - **Azure Disk Encryption** — ADE is incompatible with NVMe. The script blocks the conversion and notes that ADE is scheduled for retirement (September 2028); Encryption at Host is the recommended replacement.
 - **Azure Site Recovery** — ASR Mobility Service extension is detected and a warning is shown before proceeding.
-- **SKU availability** — target size must be available in the VM's region and zone, and not restricted for the subscription.
-- **vCPU quota** — family quota, regional quota, and Spot quota are checked.
+- **Ephemeral OS disk** — VMs with an ephemeral OS disk (`DiffDiskSettings.Option = Local`) are blocked. The script requires a managed disk for snapshotting and patching.
+- **Unmanaged OS disk** — VMs using a VHD in a Storage Account (`ManagedDisk = null`) are blocked. Migrate to a managed disk first with `Convert-AzVMManagedDisk`.
+- **Generation check** — Generation 1 VMs are blocked when the target controller is NVMe.
+- **Windows version** — Windows Server 2019 (build 17763) or later is required for NVMe. Stage 1 reads the imageReference SKU for first-party marketplace images; Stage 2 falls back to a RunCommand registry query for custom images and Shared Image Gallery VMs.
+- **Shared Disks on Windows Server 2019** — Shared Disks with NVMe are not supported on Windows Server 2019. Data disks with `MaxShares > 1` are detected and the script blocks.
+- **TrustedLaunch / ConfidentialVM** — ConfidentialVMs are blocked unconditionally. TrustedLaunch VMs targeting NVMe are blocked unless `-AllowTrustedLaunchDowngrade` is specified.
+- **SKU availability** — target size must be available in the VM's region and zone, and not restricted for the subscription (`NotAvailableForSubscription`).
+- **TrustedLaunch support on target size** — when `-AllowTrustedLaunchDowngrade` is used, the target size must not have `TrustedLaunchDisabled=True`.
+- **vCPU quota** — family quota, regional quota, and Spot/low-priority quota are checked, accounting for vCPUs freed when the source VM is deallocated.
 - **Data disk count** — the current number of data disks must not exceed the target size's `MaxDataDiskCount`.
 - **NIC count** — the current number of NICs must not exceed the target size's `MaxNetworkInterfaces`.
 - **Premium IO** — if the target size does not support Premium IO, the script blocks when Premium SSD disks are attached.
 - **Write Accelerator** — warns if Write Accelerator is enabled but the target size does not support it.
-- **TrustedLaunch compatibility** — when `-AllowTrustedLaunchDowngrade` is used, the target size must support TrustedLaunch (`TrustedLaunchDisabled` must not be True).
-- **Shared Disks** — Shared Disks with NVMe are not supported on Windows Server 2019.
+- **Unmanaged data disks (PATH B)** — PATH B reattaches data disks by managed disk ID. Unmanaged data disks are detected after path selection, before the VM is stopped.
+- **Uniform VMSS membership (PATH B)** — VMs that are members of a Uniform-orchestration scale set cannot be independently deleted and recreated. The script blocks PATH B for Uniform VMSS members and suggests `-ForcePathA` or `Update-AzVmssInstance` instead. Flexible-mode VMSS members are supported.
+- **System-assigned MI RBAC** — when PATH B is selected and the VM has a system-assigned managed identity, all direct role assignments are enumerated and logged at pre-flight. If any are found and `-RestoreSystemAssignedRBAC` is not specified, you will be asked to confirm before proceeding (skipped with `-Force`).
 - **v6+ SCSI mismatch** — when `-IgnoreSKUCheck` is used and the target looks like a v6+ size (NVMe-only generation) but `-NewControllerType SCSI` was specified, a warning is shown because most v6+ sizes do not support SCSI.
-- **Unmanaged data disks** — PATH B requires managed data disks. Unmanaged data disks (VHDs in Storage Accounts) are detected after path selection, before the VM is stopped.
-- **System-assigned MI RBAC** — when PATH B is selected and the VM has a system-assigned managed identity, all direct role assignments are enumerated and logged. If any are found and `-RestoreSystemAssignedRBAC` is not specified, you will be asked to confirm before proceeding (skipped with `-Force`).
 
 ---
 
@@ -245,14 +267,15 @@ Listed from least to most impactful. Using these flags means the script cannot v
 | `-IgnoreQuotaCheck` | Skip vCPU quota check |
 | `-IgnoreSKUCheck` | Skip SKU availability and capability checks |
 | `-IgnoreWindowsVersionCheck` | Skip Windows version check (>= 2019 required for NVMe) |
-| `-IgnoreOSCheck` | Skip all OS-level checks (no RunCommand is executed at all) |
-| `-SkipExtensionReinstall` | Skip automatic extension reinstallation after PATH B recreation |
+| `-IgnoreOSCheck` | Skip the NVMe driver compatibility checks in STEP 1. Does **not** suppress STEP 1b (pagefile migration) or STEP 1c (NVMe temp disk startup task installation) — those still run when required. Use when the VM agent is unavailable or unreachable. |
+| `-SkipExtensions` | Skip automatic reinstallation of one or more specific extensions by **Name** during PATH B recreation. Use for extensions managed externally (e.g. by Azure Policy, Microsoft Defender for Cloud, or a third-party platform) that will redeploy automatically. Example: `-SkipExtensions 'QualysAgent'` |
+| `-SkipExtensionReinstall` | Skip automatic extension reinstallation after PATH B recreation entirely |
 
 ### Other
 
 | Parameter | Description |
 |---|---|
-| `-SleepSeconds` | Seconds to wait before starting the VM after resize. Default: `15` |
+| `-SleepSeconds` | Seconds to wait before starting the VM after resize (PATH A). Default: `15` |
 
 ---
 
@@ -267,7 +290,7 @@ When `-FixOperatingSystemSettings` is specified, the script runs OS preparation 
 
 **Linux:**
 - Rebuilds initrd/initramfs to include the NVMe driver. Uses `update-initramfs` on Debian/Ubuntu and `dracut -f --kver $(uname -r)` on RHEL, Rocky, SLES, and Azure Linux. Both explicitly target the currently running kernel to avoid false results when multiple kernels are installed.
-- Adds `nvme_core.io_timeout=240` to the GRUB kernel parameters. This is the value Microsoft recommends for Azure NVMe storage.
+- Adds `nvme_core.io_timeout=240` to the GRUB kernel parameters. This is the value Microsoft recommends for Azure NVMe storage. If a different value is already set, the script warns rather than overwriting it.
 - Installs `azure-vm-utils` to create stable `/dev/disk/azure/data/by-lun/X` NVMe symlinks. These replace the SCSI `scsi1/lunX` paths from waagent, which stop working after the controller switch. The package is pre-installed on Ubuntu 22.04/24.04/25.04, Azure Linux 2.0, Fedora 42, and Flatcar.
 - Checks `fstab` for raw `/dev/sd*` device names that will break after the controller switch, and flags `/dev/sdb*` temp disk entries for removal. Also warns about raw `/dev/nvme*` paths, which are unstable on v7+ sizes where Azure distributes disks across multiple controllers based on caching policy.
 - Checks `/etc/waagent.conf` for `ResourceDisk.Format=y` and `ResourceDisk.EnableSwap=y`. Both should be set to `n` after conversion, since waagent can no longer find the temp disk at `/dev/sdb`.
@@ -291,7 +314,7 @@ Azure blocks SCSI-to-NVMe conversion on TrustedLaunch VMs at the platform level.
 
 > **PATH B (VM recreation) also destroys vTPM state — even without `-AllowTrustedLaunchDowngrade`**
 >
-> The vTPM chip is bound to the VM resource, not to the OS disk. When PATH B deletes the VM shell (STEP 6B), the vTPM is destroyed permanently regardless of whether the security type was downgraded first. This applies to any TrustedLaunch VM that takes PATH B — for example, a Windows VM moving between disk architecture categories (local-disk ↔ diskless ↔ NVMe temp disk) while staying on SCSI. The TrustedLaunch security posture is restored on the new VM, but vTPM-stored credentials (BitLocker keys sealed to vTPM, FIDO2/WHfB keys, attestation certs) must be re-provisioned. The script warns before proceeding.
+> The vTPM chip is bound to the VM resource, not to the OS disk. When PATH B deletes the VM shell (STEP 6B), the vTPM is destroyed permanently regardless of whether the security type was downgraded first. This applies to any TrustedLaunch VM that takes PATH B — for example, a Windows VM moving between disk architecture categories (local-disk ↔ diskless ↔ NVMe temp disk) while staying on SCSI. The TrustedLaunch security posture is restored on the new VM via the SecurityProfile in STEP 7B, but vTPM-stored credentials (BitLocker keys sealed to vTPM, FIDO2/WHfB keys, attestation certs) must be re-provisioned. The script warns before proceeding.
 
 Run with `-DryRun` first to see exactly what will happen.
 
@@ -351,7 +374,6 @@ New-AzRoleAssignment -ObjectId $newPrincipalId `
 ```
 
 ---
-
 
 ## Examples
 
@@ -430,7 +452,7 @@ The script is designed to be restartable. Each step checks current state before 
 A few specific situations to be aware of:
 
 **Failure after STEP 2a (TrustedLaunch downgrade) but before STEP 4Aa/7B (restore):**
-TrustedLaunch has been removed but not yet restored. The VM is sitting at `Standard` security type. Re-run with the same parameters and `-AllowTrustedLaunchDowngrade`. Because the VM is already at `Standard`, `_isTrustedLaunchDowngrade` evaluates to `false` on re-run and STEP 2a is skipped automatically — the script continues with the remaining steps from where it left off. However, STEP 4Aa (TrustedLaunch re-enable) is also skipped on re-run for the same reason. The first run's log and `finally` block already printed a manual restore command (`ACTION REQUIRED`); use that to re-enable TrustedLaunch by hand before or after re-running.
+TrustedLaunch has been removed but not yet restored. The VM is sitting at `Standard` security type. Re-run with the same parameters and `-AllowTrustedLaunchDowngrade`. Because the VM is already at `Standard`, STEP 2a is skipped automatically — the script continues with the remaining steps from where it left off. However, STEP 4Aa (re-enable TrustedLaunch on PATH A) is also skipped on re-run for the same reason. The first run's log and `finally` block already printed a manual restore command (`ACTION REQUIRED`); use that to re-enable TrustedLaunch by hand before or after re-running.
 
 **Failure after STEP 6B (VM deleted) but before STEP 7B (VM recreated):**
 The VM shell has been deleted but the OS disk and NICs are intact — `DeleteOption` was set to `Detach` before deletion. Re-run with the same parameters. The script recreates the VM from the original OS disk directly — the snapshot is a safety backup only and is not used for recreation itself.
@@ -449,7 +471,7 @@ For anything else, check the log file (use `-WriteLogfile`) for the last complet
 
 ## Rollback
 
-**PATH A (resize):** Run the script again with `-NewControllerType SCSI` and the original VM size. `-AllowTrustedLaunchDowngrade` is not needed for rollback.
+**PATH A (resize):** Run the script again with `-NewControllerType SCSI` and the original VM size. `-AllowTrustedLaunchDowngrade` is not needed for rollback — the TrustedLaunch restriction only applies to SCSI-to-NVMe conversion, not the reverse.
 
 **PATH B (recreation):** The simplest rollback is to re-run the script with the original controller type and size:
 
@@ -470,30 +492,49 @@ If that is not possible, restore from the OS disk snapshot (only available if `-
 
 ## Extension reinstallation (PATH B)
 
-After VM recreation the script reinstalls VM extensions automatically. Extensions that require protected settings cannot be reinstalled without operator input and are always skipped, with a MANUAL action notice in the log:
+After VM recreation the script reinstalls VM extensions automatically. Extensions fall into four categories.
 
-- `AzureDiskEncryption` / `AzureDiskEncryptionForLinux` — multi-step reinstall required
-- `CustomScriptExtension` / `CustomScript` — re-execution is dangerous and may contain secrets
-- `ADDomainExtension` — Active Directory domain join password is in protected settings
-- `Microsoft.Powershell.DSC` / `DSCForLinux` — may contain credentials in protected settings
-- `IaaSDiagnostics` / `LinuxDiagnostic` — storage account key is in protected settings
-- `ServiceFabricNode` — cluster/client certificate config is in protected settings
-- `VMAccessAgent` / `VMAccessForLinux` — credentials are in protected settings; reinstall with new credentials
-- `DockerExtension` — TLS certs and registry credentials in protected settings; also retired since November 2018
+### MANUAL — protected settings, must reinstall by hand
 
-Reinstall these manually once the VM is running.
+These extensions cannot be reinstalled automatically because their protected settings are never returned by the Azure API. A MANUAL notice is logged for each one.
 
-Extensions that are reinstalled automatically:
+| Extension type | Reason |
+|---|---|
+| `AzureDiskEncryption` / `AzureDiskEncryptionForLinux` | Multi-step reinstall required |
+| `CustomScriptExtension` / `customScript` | Re-execution is dangerous and may contain secrets |
+| `ADDomainExtension` | Active Directory domain join password in protected settings |
+| `Microsoft.Powershell.DSC` / `DSCForLinux` | May contain credentials in protected settings |
+| `IaaSDiagnostics` / `LinuxDiagnostic` | Storage account key in protected settings |
+| `ServiceFabricNode` | Cluster/client certificate config in protected settings |
+| `VMAccessAgent` / `VMAccessForLinux` | Credentials in protected settings; reinstall with new credentials |
+| `DockerExtension` | TLS certs and registry credentials in protected settings; also retired since November 2018 |
+
+### SKIP — Azure-managed, redeploys automatically via service plane
+
+These extensions are managed by an Azure service and redeploy themselves automatically after recreation. Attempting to install them via `Set-AzVMExtension` would conflict with the managing service.
+
+| Extension type | Managed by |
+|---|---|
+| `VMSnapshot` / `VMSnapshotLinux` | Azure Backup — reinstalls on next scheduled backup job; existing recovery points and backup schedules are preserved because the VM resource ID is unchanged |
+| `MDE.Windows` / `MDE.Linux` | Microsoft Defender for Cloud — redetects and re-pushes MDE onboarding automatically |
+| `AzurePolicyforWindows` / `ConfigurationforWindows` / `ConfigurationforLinux` | Azure Policy — re-evaluates compliance and redeploys within ~15 minutes |
+| `GuestAttestation` / `GuestAttestationLinux` | Azure platform — re-pushed automatically for TrustedLaunch VMs |
+
+### SKIP — `-SkipExtensions` or `-SkipExtensionReinstall`
+
+Extensions explicitly excluded by the operator are skipped regardless of their type. This is the right approach for extensions deployed by external systems such as Azure Policy, Microsoft Defender for Cloud, or third-party management platforms that push their own extensions with correct onboarding settings.
+
+### AUTO — reinstalled automatically by STEP 8B
+
+All other extensions are reinstalled via `Set-AzVMExtension`. Some have additional internal handling:
 
 - **Key Vault VM extension** (`KeyVaultForWindows` / `KeyVaultForLinux`) — uses managed identity, no protected settings. When the VM has only a system-assigned identity, the extension installs in STEP 8B before RBAC is restored in STEP 9B. With `-RestoreSystemAssignedRBAC` the extension will work once STEP 9B completes; without it, update the Key Vault RBAC or access policy to the new principal ID manually.
-- **Azure Monitor Agent** — uses managed identity; Data Collection Rule associations survive recreation.
-- **AAD SSH login / Azure AD login** — RBAC is on the VM resource ID, which is unchanged after recreation with the same name and resource group.
-- **MMA/OMS** — workspace key looked up automatically via Az.OperationalInsights if available.
-- **SqlIaasAgent** — the `Microsoft.SqlVirtualMachine/SqlVirtualMachines` resource survives VM deletion and re-links automatically once the VM is recreated with the same name.
+- **Azure Monitor Agent** (`AzureMonitorWindowsAgent` / `AzureMonitorLinuxAgent`) — uses managed identity. Data Collection Rule associations reference the VM resource ID and are preserved across recreation.
+- **AAD SSH login / Azure AD login** (`AADSSHLoginForLinux` / `AADLoginForWindows`) — no protected settings. RBAC roles (e.g. Virtual Machine Administrator Login) are assigned on the VM resource ID, which is unchanged after recreation with the same name and resource group.
+- **MMA/OMS** (`MicrosoftMonitoringAgent` / `OmsAgentForLinux`) — workspace key is looked up automatically from the Log Analytics workspace via `Az.OperationalInsights` if available. Falls back to MANUAL if the module is absent or the workspace cannot be found.
+- **SqlIaasAgent** — the `Microsoft.SqlVirtualMachine/SqlVirtualMachines` resource survives VM deletion and re-links automatically once the VM is recreated with the same name. The script verifies this and only calls `New-AzSqlVM` if the resource is missing (using PAYG as a safe default).
 
 After reinstall, the script performs a post-validation check: it waits 15 seconds and then reads the provisioning state of each extension from Azure. Any extension that did not reach `Succeeded` is flagged as ACTION REQUIRED in the log.
-
-**Azure Backup** (`VMSnapshot` / `VMSnapshotLinux`) needs no manual action. PATH B recreates the VM with the same name and resource group, so the ARM resource ID is unchanged. Azure Backup treats it as the same VM and existing recovery points and backup schedules carry over automatically.
 
 ---
 
@@ -501,17 +542,19 @@ After reinstall, the script performs a post-validation check: it waits 15 second
 
 v6 and v7 VM sizes with a local disk (`d` in the name, e.g. `E8ads_v7`) present the temp disk as a raw, unformatted NVMe device after a deallocate or when the VM moves to a new host. A normal reboot on the same host leaves the disk intact. This differs from v5 and older, where Azure always delivered a pre-formatted NTFS or ext4 temp disk.
 
-**Windows:** When the target size is a `d`-size, the script installs a scheduled startup task (`NVMeTempDiskInit.ps1`) that checks on each boot whether the disk needs initialization, and formats it as `D:\` if so. For multi-disk VM sizes (e.g. `D16ads_v7`, `D32ads_v7`), a striped Storage Pool is created. The install location can be changed with `-NVMEDiskInitScriptLocation`. Note: the pagefile remains on `C:\` after conversion — the init task does not move it back to `D:\`. If you want the pagefile on the temp disk for performance, reconfigure it manually after verifying `D:\` is available.
+**Windows:** When the target size is a `d`-size, the script installs a scheduled startup task (`NVMeTempDiskInit.ps1`) that checks on each boot whether the disk needs initialization, and formats it as `D:\` if so. The task runs at SYSTEM startup at priority 0 (highest) with a 2-attempt restart policy. For multi-disk VM sizes (e.g. `D16ads_v7`, `D32ads_v7`), a striped Storage Pool is created across all NVMe temp disks. A `Wait-ForDrive-D.ps1.snippet.txt` helper is also written to the same folder for use in any dependent startup tasks.
+
+The install location can be changed with `-NVMEDiskInitScriptLocation`. Note: the pagefile remains on `C:\` after conversion — the init task does not move it back to `D:\`. If you want the pagefile on the temp disk for performance, reconfigure it manually after verifying `D:\` is available.
 
 **Linux:** The Azure Linux Agent (waagent) or cloud-init handles NVMe temp disk initialization on v6/v7. However, NVMe temp disk support requires waagent version 2.8 or later — older versions look for `/dev/sdb` and will fail silently. Verify the agent version on the VM if the temp disk does not appear after conversion.
 
-> If you need to change a disk's caching policy after NVMe conversion, stop the VM first, make the change, then start it again. Changing caching settings on a running NVMe VM can cause the disk to reassign to a different controller, which changes device paths and can cause remapping issues.
+> If you need to change a disk's caching policy after NVMe conversion, stop the VM first, make the change, then start it again. Changing caching settings on a running NVMe VM can cause the disk to reassign to a different controller, which changes device paths and can cause remapping issues. On v7+ sizes this is particularly important: Azure distributes cached and uncached disks across two separate NVMe controllers, and a caching change silently moves the disk between controllers on the next boot.
 
 ---
 
 ## Error handling and pipeline use
 
-Fatal errors are raised internally with `throw` (via an `Stop-Script` helper function) rather than `exit 1`. This ensures the script's own `finally` block always runs — restoring breaking-change warning settings and emitting any pending TrustedLaunch restore instructions — before the process exits.
+Fatal errors are raised internally with `throw` (via a `Stop-Script` helper) rather than `exit 1`. This ensures the script's own `finally` block always runs — restoring breaking-change warning settings and emitting any pending TrustedLaunch restore instructions — before the process exits.
 
 The top-level `catch` block converts the thrown exception into a clean `exit 1`, giving external callers a reliable non-zero exit code. A custom `AzVMFatalError` class lets the catch block distinguish expected termination (message already written to the log by `Stop-Script`) from unhandled exceptions (which are logged automatically by the outer catch).
 
@@ -560,6 +603,10 @@ On PowerShell 5.1, all fetching is sequential (same result, slightly slower for 
 
 > **Note:** Azure SDK objects can lose properties when serialised across PS7 parallel runspace boundaries. Both batch helpers (`Get-AzNICBatch` and `Get-AzDiskBatch`) pre-extract the needed ID and Name fields into plain `PSCustomObject` instances before entering the parallel block to avoid this.
 
+### OS disk controller PATCH and token handling
+
+The `diskControllerTypes` property is updated via a direct ARM REST PATCH rather than `Update-AzVM`. On PowerShell 7+, the access token is kept as a `SecureString` and passed directly to `Invoke-RestMethod -Authentication Bearer`, so it is never materialised as a plaintext CLR string in memory. On PowerShell 5.1, the token is briefly marshalled to a plain string (unavoidable), then immediately cleared from the variable scope after the request completes.
+
 ---
 
 ## Known limitations
@@ -570,17 +617,16 @@ On PowerShell 5.1, all fetching is sequential (same result, slightly slower for 
 - Unmanaged disks (VHDs in Storage Accounts) are not supported — migrate to managed disks first with `Convert-AzVMManagedDisk`. Unmanaged data disks are detected after path selection, before the VM is stopped.
 - Uniform VMSS members cannot use PATH B (recreation). PATH A (in-place resize) works fine. Use `-ForcePathA` or use `Update-AzVmssInstance` for model changes.
 - Management locks (`CanNotDelete` or `ReadOnly`) on the VM, its OS disk, data disks, or NICs must be removed before running the script. The script detects these and aborts before making any changes.
-- NVMe VMs are not supported by Azure Site Recovery.
+- NVMe VMs are not supported by Azure Site Recovery. The script detects an active ASR Mobility Service extension and warns before continuing. If you proceed, ASR replication for that VM breaks and needs to be re-evaluated afterwards.
 - Azure Disk Encryption (ADE) is not compatible with NVMe. Note: ADE is scheduled for retirement on September 15, 2028 — Microsoft recommends migrating to Encryption at Host.
 - Extensions with protected settings must be reinstalled manually after PATH B recreation.
 - PATH B applies to Windows only. Linux always uses PATH A.
 - The script is not fully idempotent when re-run after a failure between STEP 6B (VM deleted) and STEP 7B (VM recreated). In that case the VM shell is gone but all disks and NICs are intact. The script detects this situation and provides manual recovery instructions.
-- System-assigned managed identity RBAC assignments are **not** automatically restored unless `-RestoreSystemAssignedRBAC` is specified. The script always enumerates and logs the assignments, and asks for confirmation if any are found. Automatic restore is an explicit opt-in.
-- Boot diagnostics using a storage account in a different subscription cannot be restored automatically.
+- System-assigned managed identity RBAC assignments are **not** automatically restored unless `-RestoreSystemAssignedRBAC` is specified. The script always enumerates and logs the assignments at pre-flight, and asks for confirmation if any are found. Automatic restore is an explicit opt-in.
+- Boot diagnostics using a storage account in a different subscription cannot be restored automatically. The script falls back to managed boot diagnostics (Azure-managed storage) in this case.
 - Parallel NIC and disk fetching (`ForEach-Object -Parallel`) requires PowerShell 7 or later. On PS5.1 fetching is sequential, which is slightly slower for VMs with 3 or more NICs or data disks but functionally identical.
 - Fatal errors exit the script with `exit 1`. In calling scripts or pipelines, check `$LASTEXITCODE` — wrapping the call in `try/catch` will not intercept `exit 1`. See [Error handling and pipeline use](#error-handling-and-pipeline-use).
 
-- **Azure Site Recovery (ASR):** NVMe VMs are not supported by ASR. The script checks for an active ASR Mobility Service extension and warns before continuing. If you proceed, ASR replication for that VM breaks and needs to be re-evaluated afterwards.
 ---
 
 ## References

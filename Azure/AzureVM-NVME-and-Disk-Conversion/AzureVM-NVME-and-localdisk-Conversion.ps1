@@ -277,7 +277,7 @@
         -AllowTrustedLaunchDowngrade -FixOperatingSystemSettings -StartVM -WriteLogfile
 
 .NOTES
-    Version: 1.0.2
+    Version: 2.14.0
 
     Module requirements (verified at runtime unless -IgnoreAzureModuleCheck is specified):
       Az.Compute   >= 7.2.0   (DiskControllerType, SecurityProfile, Add-AzVmGalleryApplication,
@@ -923,6 +923,7 @@ function Get-VMResourcesWithBadDeleteOption {
     return $items
 }
 
+# Note: Export-SystemAssignedRBACAssignments was removed in v2.10.0.
 # RBAC assignment enumeration was moved to the pre-flight block (before any VM changes)
 # so the operator can be informed early and confirm/deny proceeding. STEP 5B now writes
 # the export file directly from $_preflightRbacAssignments without a redundant API call.
@@ -1076,7 +1077,7 @@ function Write-VTPMDataLossWarning {
 ##############################################################################################################
 
 WriteLog "=======================================================" "IMPORTANT"
-WriteLog " AzureVM-NVME-and-localdisk-Conversion.ps1  " "IMPORTANT"
+WriteLog " AzureVM-NVME-and-localdisk-Conversion.ps1  v2.14.0" "IMPORTANT"
 WriteLog "=======================================================" "IMPORTANT"
 if ($WriteLogfile) {
     WriteLog "Log file: $(Resolve-Path -Path '.' -ErrorAction SilentlyContinue)\$script:_logfile" "IMPORTANT"
